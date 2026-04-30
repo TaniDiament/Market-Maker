@@ -7,6 +7,7 @@ metadata:
   namespace: market-maker
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     app: zk
   ports:
@@ -39,6 +40,7 @@ metadata:
 spec:
   serviceName: zk-hs
   replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: zk
@@ -47,6 +49,15 @@ spec:
       labels:
         app: zk
     spec:
+      # --- ADDED AFFINITY BLOCK START ---
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      # --- ADDED AFFINITY BLOCK END ---
       containers:
         - name: zookeeper
           image: zookeeper:3.9
@@ -60,7 +71,6 @@ spec:
               value: "server.1=zk-0.zk-hs:2888:3888;2181 server.2=zk-1.zk-hs:2888:3888;2181 server.3=zk-2.zk-hs:2888:3888;2181"
             - name: ZOO_4LW_COMMANDS_WHITELIST
               value: "srvr,ruok,mntr,stat,conf"
-          # ZOO_MY_ID is derived from the StatefulSet pod ordinal (zk-0 -> 1, zk-1 -> 2, ...).
           command:
             - sh
             - -c
