@@ -8,10 +8,13 @@ $nodes = @(
 )
 
 $sourceFile = "dist/images.tar"
-$destinationPath = "/home/sack/images.tar"
+$destinationPath = "/home/sack/marketmaker/images.tar"
 
 foreach ($node in $nodes) {
     Write-Host "`n>>> Processing node: $node" -ForegroundColor Cyan
+
+    # NEW: Ensure the directory exists before transferring
+    ssh "sack@${node}" "mkdir -p /home/sack/marketmaker"
 
     # 1. Transfer the bundle
     Write-Host "Transferring $sourceFile..."

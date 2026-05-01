@@ -69,12 +69,12 @@ This script:
 1) Transfer Manifests to cp1:
 Run 
 ```powershell
-scp -r ./k8s sack@192.168.8.11:/home/sack/k8s
+ssh sack@192.168.8.11 "mkdir -p /home/sack/marketmaker"
+scp -r ./k8s sack@192.168.8.11:/home/sack/marketmaker/k8s
 ```
 2) Apply via Kustomize:
 ```powershell
-ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/k8s/"
-```
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/marketmaker/k8s/"```
 
 ## Step 6: Verification & Quorum Troubleshooting
 Monitor status from cp1:
