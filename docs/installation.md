@@ -104,8 +104,16 @@ Set `publishNotReadyAddresses: true` in the `zk-hs` service so peers can resolve
 ### Anti-Affinity: 
 Ensure ZK pods are pinned to `cp1`, `cp2`, and `cp3` to separate the coordination layer from worker traffic.
 
-## Pod Reset:
-If `mm` pods are in `CrashLoopBackOff` after ZK is ready, force a restart:
+## Startup Ordering (mm initContainers):
+The `mm` StatefulSet runs two `initContainers` (`wait-for-zk`, `wait-for-postgres`, both using `rancher/mirrored-library-busybox:1.37.0`) that block the app from starting until:
+
+1. All three ZK peers respond `imok` on port 2181 (quorum is reachable).
+2. `postgres:5432` accepts TCP connections.
+
+This eliminates the prior race where `mm` would CrashLoop until kubelet backoff happened to land after ZK election / postgres bind. If `mm` pods sit in `Init:0/2` for more than a minute, check `kubectl logs mm-0 -c wait-for-zk` (or `-c wait-for-postgres`) on cp1 — the loop prints which host it is still waiting on.
+
+## Pod Reset (fallback):
+If `mm` pods are still in `CrashLoopBackOff` after ZK and postgres are Ready, force a restart:
 Run on cp1:
 ```powershell
 doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete pods -l app=mm -n market-maker

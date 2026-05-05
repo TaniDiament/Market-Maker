@@ -125,6 +125,37 @@ spec:
                   matchLabels:
                     app: mm
                 topologyKey: kubernetes.io/hostname
+      initContainers:
+        # Block startup until ZK quorum is reachable. Without this the mm app
+        # races zk-0/1/2 (both StatefulSets use podManagementPolicy: Parallel)
+        # and CrashLoops until kubelet backoff happens to land after election.
+        - name: wait-for-zk
+          image: rancher/mirrored-library-busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              for host in zk-0.zk-hs zk-1.zk-hs zk-2.zk-hs; do
+                until [ "$(echo ruok | nc -w 2 $host 2181 2>/dev/null)" = "imok" ]; do
+                  echo "waiting for $host:2181"
+                  sleep 2
+                done
+              done
+        # Block startup until postgres accepts TCP. JPA services fail-fast on
+        # first connect; without this they CrashLoop until the PVC binds and
+        # postgres becomes Ready.
+        - name: wait-for-postgres
+          image: rancher/mirrored-library-busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z -w 2 postgres 5432; do
+                echo "waiting for postgres:5432"
+                sleep 2
+              done
       containers:
         - name: app
           image: market-maker:1.0.0
