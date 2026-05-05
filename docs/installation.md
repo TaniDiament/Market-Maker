@@ -46,6 +46,9 @@ Since the nodes cannot reach Docker Hub, images must be bundled on a machine wit
 
 ### A. Create the Image Bundle (Laptop with Internet)
 ```powershell
+docker pull eclipse-temurin:21-jre-alpine
+docker pull postgres:16-alpine
+docker pull zookeeper:3.9
 docker pull rancher/mirrored-pause:3.6
 docker pull rancher/local-path-provisioner:v0.0.35
 docker pull rancher/mirrored-library-busybox:1.37.0
