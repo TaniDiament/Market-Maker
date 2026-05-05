@@ -31,6 +31,10 @@ spec:
         - name: postgres
           image: postgres:16-alpine
           imagePullPolicy: IfNotPresent
+          # Default max_connections=100 is too low: 7 mm + 4 service pods at
+          # HikariCP's default pool of 10 = 110 connections. The last pod to
+          # start gets "FATAL: sorry, too many clients already" and CrashLoops.
+          args: ["postgres", "-c", "max_connections=300"]
           env:
             - name: POSTGRES_USER
               value: postgres
