@@ -1,5 +1,7 @@
 package edu.yu.marketmaker.marketmaker;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.annotation.Profile;
@@ -17,6 +19,8 @@ import java.util.concurrent.atomic.AtomicLong;
 @Component
 @Profile("market-maker-node")
 public class MarketMaker implements ApplicationRunner {
+
+    private static final Logger log = LoggerFactory.getLogger(MarketMaker.class);
 
     private final SnapshotTracker positionTracker;
     private final QuoteGenerator quoteGenerator;
@@ -98,6 +102,10 @@ public class MarketMaker implements ApplicationRunner {
     @Override
     public void run(ApplicationArguments args) {
         // Subscribe once at startup so incoming snapshots are continuously processed.
-        positionTracker.getPositions().subscribe(this::handlePosition);
+        // PositionTracker.getPositions() retries forever on errors, so a terminal
+        // onError reaching here is unexpected — log loudly rather than swallow.
+        positionTracker.getPositions().subscribe(
+                this::handlePosition,
+                err -> log.error("position subscription terminated", err));
     }
 }
