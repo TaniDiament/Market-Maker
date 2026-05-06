@@ -8,6 +8,7 @@ import org.springframework.stereotype.Component;
 
 import edu.yu.marketmaker.model.StateSnapshot;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
 
 import java.time.Duration;
@@ -72,6 +73,11 @@ public class PositionTracker implements SnapshotTracker {
                 .retryWhen(Retry.fixedDelay(Long.MAX_VALUE, STREAM_RECONNECT_DELAY)
                         .doBeforeRetry(sig -> log.warn(
                                 "state.stream subscription error, retrying: {}",
-                                sig.failure().toString())));
+                                sig.failure().toString())))
+                // Hop off the RSocket event loop. Downstream calls
+                // ProductionQuoteGenerator.generateQuote which uses .block()
+                // for the reservation roundtrip — Reactor refuses blocking
+                // on netty's epoll threads.
+                .publishOn(Schedulers.boundedElastic());
     }
 }

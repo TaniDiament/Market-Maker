@@ -102,10 +102,22 @@ public class MarketMaker implements ApplicationRunner {
     @Override
     public void run(ApplicationArguments args) {
         // Subscribe once at startup so incoming snapshots are continuously processed.
-        // PositionTracker.getPositions() retries forever on errors, so a terminal
-        // onError reaching here is unexpected — log loudly rather than swallow.
+        // Per-snapshot try/catch so a single failed handlePosition (e.g. a
+        // transient reservation timeout) doesn't cancel the whole subscription
+        // — Reactor's LambdaSubscriber turns a thrown onNext into a terminal
+        // onError, and we need to keep processing subsequent snapshots.
+        // PositionTracker.getPositions() also retries forever on upstream
+        // errors, so a terminal onError reaching here is unexpected.
         positionTracker.getPositions().subscribe(
-                this::handlePosition,
+                snapshot -> {
+                    try {
+                        handlePosition(snapshot);
+                    } catch (Exception e) {
+                        String sym = (snapshot != null && snapshot.position() != null)
+                                ? snapshot.position().symbol() : "?";
+                        log.warn("error processing snapshot for {}: {}", sym, e.toString());
+                    }
+                },
                 err -> log.error("position subscription terminated", err));
     }
 }
