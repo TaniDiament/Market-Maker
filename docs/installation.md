@@ -45,6 +45,16 @@ The K3s services must be running for the container runtime socket (`containerd.s
 Since the nodes cannot reach Docker Hub, images must be bundled on a machine with internet and transferred manually.
 
 ### A. Create the Image Bundle (Laptop with Internet)
+
+**1. Build the application image.** `Dockerfile.offline` copies the Maven jar into a minimal `eclipse-temurin` image. Build the jar first, then the image:
+
+```powershell
+mvn -DskipTests clean package
+docker build -f Dockerfile.offline -t market-maker:1.0.0 .
+```
+
+**2. Pull the third-party images** (only needed first time, or after a version bump):
+
 ```powershell
 docker pull eclipse-temurin:21-jre-alpine
 docker pull postgres:16-alpine
@@ -53,6 +63,11 @@ docker pull rancher/mirrored-pause:3.6
 docker pull rancher/local-path-provisioner:v0.0.35
 docker pull rancher/mirrored-library-busybox:1.37.0
 docker pull ghcr.io/headlamp-k8s/headlamp:v0.39.0
+```
+
+**3. Save everything into one tarball:**
+
+```powershell
 docker save -o dist/images.tar `
   market-maker:1.0.0 `
   eclipse-temurin:21-jre-alpine `
@@ -64,7 +79,9 @@ docker save -o dist/images.tar `
   ghcr.io/headlamp-k8s/headlamp:v0.39.0
 ```
 
-> **Note:** `local-path-provisioner` and `mirrored-library-busybox` are required for the postgres PVC to bind on an air-gapped cluster — without them, every JPA service in the stack will CrashLoopBackOff because postgres never reaches Ready. The exact tags above match this cluster's installed K3s; if K3s is upgraded, re-run `kubectl get deploy -n kube-system local-path-provisioner -o jsonpath='{...}'` to confirm the tags before bundling.
+> **Shortcut:** `bash ./scripts/build-offline-bundle.sh` runs steps 1 + 2 + 3 in one shot (requires WSL or git-bash for the bash interpreter).
+
+> **Note:** `local-path-provisioner` and `mirrored-library-busybox` are required for the postgres and ZK PVCs to bind on an air-gapped cluster — without them, every JPA service in the stack will CrashLoopBackOff because postgres never reaches Ready, and ZK will lose every znode on each pod restart because its `/data` mount has nothing to back it. The exact tags above match this cluster's installed K3s; if K3s is upgraded, re-run `kubectl get deploy -n kube-system local-path-provisioner -o jsonpath='{...}'` to confirm the tags before bundling.
 ### B. Distribute and Import (Connected to Cluster)
 Run 
 ```powershell
@@ -87,7 +104,77 @@ scp -r ./k8s sack@192.168.8.11:/home/sack/marketmaker/k8s
 ```powershell
 ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/marketmaker/k8s/"```
 
-## Step 6: Verification & Quorum Troubleshooting
+> **Upgrading from a pre-PVC ZK install:** the `zk` StatefulSet now declares `volumeClaimTemplates` so znodes survive pod restarts. Kubernetes does **not** allow adding `volumeClaimTemplates` to an existing StatefulSet; if `kubectl apply` reports `Forbidden` on the `zk` resource, delete the StatefulSet first (no app data is at risk — ZK was non-persistent before, so its znodes are already ephemeral): `kubectl -n market-maker delete statefulset zk`, then re-apply.
+
+---
+
+## Step 6: Updating the Application Image (Code → Cluster)
+Use this workflow whenever Java source under `src/main/` changes. Manifest-only changes (`k8s/*.yaml`) need only steps 4 and 5 from this section; you can skip the rebuild.
+
+### A. Rebuild the image on your laptop
+```powershell
+mvn -DskipTests clean package
+docker build -f Dockerfile.offline -t market-maker:1.0.0 .
+docker save -o dist/images.tar `
+  market-maker:1.0.0 `
+  eclipse-temurin:21-jre-alpine `
+  postgres:16-alpine `
+  zookeeper:3.9 `
+  rancher/mirrored-pause:3.6 `
+  rancher/local-path-provisioner:v0.0.35 `
+  rancher/mirrored-library-busybox:1.37.0 `
+  ghcr.io/headlamp-k8s/headlamp:v0.39.0
+```
+The third-party images already exist locally from Step 4, so the `docker save` is fast — only the new `market-maker:1.0.0` layer is freshly written. The script `bash ./scripts/build-offline-bundle.sh` does the same in one shot.
+
+### B. Purge the stale image on every node
+This is the step that's easy to forget. The MM pods use `imagePullPolicy: IfNotPresent`, and the new tarball still tags the image as `market-maker:1.0.0`, so containerd happily keeps the *old* layer cached and ignores the new one. You must explicitly remove the cached image first:
+
+```powershell
+.\scripts\remove-image.ps1
+```
+This loops over every node and runs `doas k3s ctr -n k8s.io images rm docker.io/library/market-maker:1.0.0`. You can verify with:
+```powershell
+ssh sack@192.168.8.11 "doas k3s ctr -n k8s.io images ls | Select-String market-maker"
+```
+
+### C. Distribute the fresh tarball
+```powershell
+.\scripts\distribute-images.ps1
+```
+This scps `dist/images.tar` to every node and re-imports it. Imports are skipped silently for images already present, so only `market-maker:1.0.0` is actually re-loaded — the rest of the bundle is a cheap no-op.
+
+### D. Re-apply manifests if any changed
+Skip this step for pure code changes. For YAML or properties changes, ship them too:
+```powershell
+scp -r ./k8s sack@192.168.8.11:/home/sack/marketmaker/k8s
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/marketmaker/k8s/"
+```
+
+### E. Restart pods so they pick up the new image
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker rollout restart statefulset/mm"
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker rollout status statefulset/mm"
+```
+For non-MM services that also use `market-maker:1.0.0` (`exchange`, `trading-state`, `exposure-reservation`, `external-publisher`), restart their Deployments too:
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker rollout restart deploy/exchange deploy/trading-state deploy/exposure-reservation deploy/external-publisher"
+```
+
+### F. Verify the new code is running
+```powershell
+# Confirm every node now has only the freshly imported image (single sha)
+ssh sack@192.168.8.11 "doas k3s ctr -n k8s.io images ls | Select-String market-maker"
+
+# Confirm no pods are stuck on a stale image (RestartCount=0 after rollout, all 1/1 Running)
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker get pods -o wide"
+```
+
+> **Common pitfall:** if pods come up but behavior looks unchanged, you almost certainly skipped step B. The new tarball was distributed and re-imported, but containerd kept using the old cached layer because the tag didn't change. Re-run `.\scripts\remove-image.ps1` and then `.\scripts\distribute-images.ps1`.
+
+---
+
+## Step 7: Verification & Quorum Troubleshooting
 Monitor status from cp1:
 ```powershell
 doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n market-maker -o wide
@@ -119,7 +206,7 @@ Run on cp1:
 doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete pods -l app=mm -n market-maker
 ```
 
-## Step 7: Headlamp Cluster UI
+## Step 8: Headlamp Cluster UI
 A web UI for inspecting cluster state is deployed alongside the application via `k8s/headlamp.yaml` and exposed on **NodePort 30090** of every node.
 
 1) Browse to `http://192.168.8.11:30090` (or any other node IP).
@@ -129,7 +216,54 @@ ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n 
 ```
 The token is bound to a `cluster-admin` ClusterRoleBinding so Headlamp can see all namespaces (kube-system, market-maker, etc). Tokens are short-lived; re-run the command above to refresh.
 
-## Step 8: Running the Integration Test
+## Step 9: Stopping the Application (Without Stopping the Cluster)
+Use this when you want to free cluster resources or pause the app between dev sessions, but you want to keep K3s itself running so other workloads stay healthy and you don't have to wait for a full cluster restart.
+
+### Option A: Scale every workload to zero (recommended)
+Scales all Deployments and StatefulSets in the `market-maker` namespace to `replicas: 0`. Pods terminate, but Services, ConfigMaps, and PersistentVolumeClaims are preserved — so postgres rows, ZK znodes, and PVC bindings survive.
+
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl scale -n market-maker statefulset --all --replicas=0"
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl scale -n market-maker deployment --all --replicas=0"
+```
+
+Confirm everything is gone:
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n market-maker"
+```
+Should report `No resources found in market-maker namespace.` once termination completes (a few seconds).
+
+To bring it back up, re-apply the manifests — `kubectl apply` restores each workload's declared replica count from the YAML:
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/marketmaker/k8s/"
+```
+
+### Option B: Stop only the MM JVMs (keep infra running)
+When you want to recycle the seven `mm` pods but leave exchange, trading-state, exposure-reservation, external-publisher, postgres, and ZK alive:
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl scale -n market-maker statefulset/mm --replicas=0"
+```
+Bring them back:
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl scale -n market-maker statefulset/mm --replicas=7"
+```
+
+### Option C: Delete everything in the namespace (clean slate)
+Tears down every workload, Service, and ConfigMap defined in the kustomization. PVCs are *retained* (the `mm` StatefulSet declares `persistentVolumeClaimRetentionPolicy: Retain` and the default storage class on this cluster keeps PVCs across deletes), so postgres and ZK data survive a restore.
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete -k /home/sack/marketmaker/k8s/"
+```
+If you also want to wipe persistent state (start fresh next time):
+```powershell
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete pvc -n market-maker --all"
+```
+Restore by re-running Step 5 — `kubectl apply -k /home/sack/marketmaker/k8s/`.
+
+> **Note:** None of these options stops K3s itself. The kubelet, containerd, and the API server stay running on every node, so re-applying or scaling back up is fast (no node startup time). Use `.\scripts\stop-cluster.ps1` only when you need to power off the nodes themselves.
+
+---
+
+## Step 10: Running the Integration Test
 Execute `ClusterIntegrationWithSystemK8sTest.java`.
 
 1) Network: Connect laptop to the Mango Router.
