@@ -11,6 +11,7 @@ import edu.yu.marketmaker.exposurereservation.ExposureReservationService;
 import edu.yu.marketmaker.persistence.*;
 import edu.yu.marketmaker.persistence.interfaces.*;
 import org.springframework.context.annotation.*;
+import com.hazelcast.config.TcpIpConfig;
 
 import java.util.UUID;
 
@@ -149,31 +150,27 @@ public class HazelcastConfig {
     }
 
     /**
-     * Network configuration for Hazelcast Nodes.
-     * Defaults to TCP-IP discovery so services across a docker-compose network
-     * can form one Hazelcast cluster (bridge networks don't forward multicast).
-     * The peer list is taken from {@code HAZELCAST_MEMBERS} (comma-separated
-     * host[:port] entries); when unset, the node starts as a cluster of one.
+     * Network configuration for Hazelcast Nodes
      * @param config config object to be used for parameters of Hazelcast
      */
-    private void configureNetwork(Config config) {
-        NetworkConfig networkConfig = config.getNetworkConfig();
-        networkConfig.setPort(5701);
-        networkConfig.setPortAutoIncrement(false);
+private void configureNetwork(Config config) {
+    NetworkConfig networkConfig = config.getNetworkConfig();
+    JoinConfig joinConfig = networkConfig.getJoin();
+    joinConfig.getMulticastConfig().setEnabled(false);
 
-        JoinConfig joinConfig = networkConfig.getJoin();
-        joinConfig.getMulticastConfig().setEnabled(false);
-        com.hazelcast.config.TcpIpConfig tcpIp = joinConfig.getTcpIpConfig();
-        tcpIp.setEnabled(true);
+    // TCP-IP discovery using docker DNS.
+    // Each service-name resolves to ALL replica IPs inside the compose network.
+    // Hazelcast will try each until it finds another cluster member.
+    TcpIpConfig tcpConfig = joinConfig.getTcpIpConfig();
+    tcpConfig.setEnabled(true);
+    tcpConfig.addMember("trading-state");
+    tcpConfig.addMember("exchange");
+    tcpConfig.addMember("exposure-reservation");
+    tcpConfig.addMember("position-ui");
 
-        String members = System.getenv("HAZELCAST_MEMBERS");
-        if (members != null && !members.isBlank()) {
-            for (String m : members.split(",")) {
-                String trimmed = m.trim();
-                if (!trimmed.isEmpty()) tcpIp.addMember(trimmed);
-            }
-        }
-    }
+    // Bind to all interfaces so other members can connect to this JVM
+    networkConfig.getInterfaces().setEnabled(false);
+}
 
     // --- IMap Beans for Dependency Injection ---
 

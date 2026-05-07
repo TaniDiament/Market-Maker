@@ -1,12 +1,11 @@
 package edu.yu.marketmaker.marketmaker;
 
+import edu.yu.marketmaker.ha.LeaderAwareRSocketClient;
+import edu.yu.marketmaker.model.StateSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Profile;
-import org.springframework.messaging.rsocket.RSocketRequester;
 import org.springframework.stereotype.Component;
-
-import edu.yu.marketmaker.model.StateSnapshot;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
@@ -21,17 +20,16 @@ import java.util.concurrent.ConcurrentHashMap;
 public class PositionTracker implements SnapshotTracker {
 
     private static final Logger log = LoggerFactory.getLogger(PositionTracker.class);
-    private static final String TRADING_STATE_HOST = "trading-state";
-    private static final int TRADING_STATE_RSOCKET_PORT = 7000;
+    private static final String TRADING_STATE_SERVICE = "trading-state";
     private static final Duration STREAM_RECONNECT_DELAY = Duration.ofSeconds(2);
 
     // Thread-safe set of symbols we're tracking. Use ConcurrentHashMap's keySet for efficiency.
     private final Set<String> trackedSymbols = ConcurrentHashMap.newKeySet();
 
-    private final RSocketRequester.Builder rsocketBuilder;
+    private final LeaderAwareRSocketClient client;
 
-    public PositionTracker(RSocketRequester.Builder rsocketRequesterBuilder) {
-        this.rsocketBuilder = rsocketRequesterBuilder;
+    public PositionTracker(LeaderAwareRSocketClient client) {
+        this.client = client;
     }
 
     @Override
@@ -58,14 +56,10 @@ public class PositionTracker implements SnapshotTracker {
     }
 
     public Flux<StateSnapshot> getPositions() {
-        // Flux.defer + a fresh requester per attempt so retries actually
-        // reconnect instead of riding a dead TCP connection. Mirrors the
-        // pattern in LeaderForwarder; without it the subscription terminates
-        // on the first network blip and the MM stops generating quotes.
+        // Flux.defer so retries actually re-resolve the leader via the registry
+        // cache instead of riding a dead TCP connection.
         return Flux.defer(() ->
-                        rsocketBuilder.tcp(TRADING_STATE_HOST, TRADING_STATE_RSOCKET_PORT)
-                                .route("state.stream")
-                                .retrieveFlux(StateSnapshot.class))
+                        client.requestStream(TRADING_STATE_SERVICE, "state.stream", StateSnapshot.class))
                 .filter(Objects::nonNull)
                 .filter(snapshot -> snapshot.position() != null)
                 .filter(snapshot -> snapshot.position().symbol() != null)

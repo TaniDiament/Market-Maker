@@ -28,6 +28,7 @@ import reactor.core.publisher.Sinks;
 import java.util.Collection;
 import java.util.Optional;
 import java.util.UUID;
+import edu.yu.marketmaker.ha.LeaderElectionService;
 
 /**
  * Trading state service controls system-wide positions.
@@ -40,6 +41,8 @@ public class TradingStateService {
 
     private final Repository<String, Position> positionRepository;
     private final Repository<UUID, Fill> fillRepository;
+    private final LeaderElectionService leaderElection;
+    
 
     /**
      * Hot multicast sink – every call to {@code submitFill} that results in a
@@ -56,10 +59,13 @@ public class TradingStateService {
      * @param positionRepository
      * @param fillRepository
      */
-    public TradingStateService(Repository<String, Position> positionRepository, Repository<UUID, Fill> fillRepository) {
-        this.positionRepository = positionRepository;
-        this.fillRepository = fillRepository;
-    }
+public TradingStateService(Repository<String, Position> positionRepository,
+                           Repository<UUID, Fill> fillRepository,
+                           LeaderElectionService leaderElection) {
+    this.positionRepository = positionRepository;
+    this.fillRepository = fillRepository;
+    this.leaderElection = leaderElection;
+}
 
     /**
      * HTTP: submit a fill via POST /state/fills
@@ -84,15 +90,19 @@ public class TradingStateService {
      * @param fill the fill to record
      * @return {@link Mono} that completes empty on success, or errors on invalid input
      */
-    @MessageMapping("state.fills")
-    public Mono<Void> submitFillRSocket(@Payload Fill fill) {
-        try {
-            processFill(fill);
-            return Mono.empty();
-        } catch (IllegalArgumentException | HazelcastException e) {
-            return Mono.error(e);
-        }
+@MessageMapping("state.fills")
+public Mono<Void> submitFillRSocket(@Payload Fill fill) {
+    if (!leaderElection.isLeader()) {
+        logger.warn("Rejecting RSocket fill {} — this replica is not the leader", fill.getId());
+        return Mono.error(new IllegalStateException("not leader"));
     }
+    try {
+        processFill(fill);
+        return Mono.empty();
+    } catch (IllegalArgumentException | HazelcastException e) {
+        return Mono.error(e);
+    }
+}
 
     /**
      * Shared logic for both HTTP and RSocket submitFill endpoints.
@@ -181,10 +191,12 @@ public class TradingStateService {
      *
      * @return a hot {@link Flux} of {@link StateSnapshot} items
      */
-    @MessageMapping("state.stream")
-    public Flux<StateSnapshot> streamPositions() {
-        // Emit current state first, then keep streaming live updates
-        Flux<StateSnapshot> currentState = Flux.fromIterable(positionRepository.getAll())
+@MessageMapping("state.stream")
+public Flux<StateSnapshot> streamPositions() {
+    if (!leaderElection.isLeader()) {
+        return Flux.error(new IllegalStateException("not leader — reconnect to current leader"));
+    }
+    Flux<StateSnapshot> currentState = Flux.fromIterable(positionRepository.getAll())
                 .map(position -> {
                     Fill lastFill = position.lastFillId() != null
                             ? fillRepository.get(position.lastFillId()).orElse(null)

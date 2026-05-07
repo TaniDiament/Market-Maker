@@ -15,6 +15,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import java.util.*;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -48,6 +49,14 @@ class TradingStateServiceTest {
 
     @MockitoBean
     private Repository<UUID, Fill> fillRepository;
+
+    @MockitoBean
+private edu.yu.marketmaker.ha.LeaderElectionService leaderElection;
+
+@org.junit.jupiter.api.BeforeEach
+void assumeLeader() {
+    org.mockito.Mockito.when(leaderElection.isLeader()).thenReturn(true);
+}
 
     @Test
     void healthEndpointReturnsOk() throws Exception {

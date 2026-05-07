@@ -45,6 +45,9 @@ class ExchangeServiceTest {
     @MockitoBean
     private OrderDispatcher orderDispatcher;
 
+    @MockitoBean
+private ReservationRequester reservationRequester;
+
     // Health
 
     @Test
