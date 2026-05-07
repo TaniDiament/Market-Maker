@@ -14,7 +14,10 @@ import java.util.Optional;
  */
 @Repository
 public interface JpaQuoteRepository extends BaseJpaRepository<QuoteEntity, String> {
-    Optional<QuoteEntity> findBySymbol(String symbol);
+    // Multiple rows per symbol can accumulate (each MM-generated quote inserts
+    // a new quote_id row). MapStore.load needs a single result, so pick the
+    // most recently expiring one — that's the freshest version of the symbol.
+    Optional<QuoteEntity> findFirstBySymbolOrderByExpiresAtDesc(String symbol);
     void deleteBySymbol(String symbol);
     List<QuoteEntity> findAllBySymbolIn(Collection<String> symbols);
 }

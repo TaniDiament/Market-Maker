@@ -54,17 +54,21 @@ public class QuoteMapStore implements MapStore<String, Quote> {
 
     @Override
     public Quote load(String key) {
-        return quoteRepository.findBySymbol(key)
+        return quoteRepository.findFirstBySymbolOrderByExpiresAtDesc(key)
                 .map(QuoteEntity::toRecord)
                 .orElse(null);
     }
 
     @Override
     public Map<String, Quote> loadAll(Collection<String> keys) {
+        // The quotes table holds historical rows per symbol; collapse to one
+        // entry per symbol by keeping the latest-expiring quote, matching
+        // load(key) semantics above.
         return quoteRepository.findAllBySymbolIn(keys).stream()
                 .collect(Collectors.toMap(
                         QuoteEntity::getSymbol,
-                        QuoteEntity::toRecord
+                        QuoteEntity::toRecord,
+                        (a, b) -> a.expiresAt() >= b.expiresAt() ? a : b
                 ));
     }
 
@@ -72,6 +76,7 @@ public class QuoteMapStore implements MapStore<String, Quote> {
     public Iterable<String> loadAllKeys() {
         return repository.findAll().stream()
                 .map(QuoteEntity::getSymbol)
+                .distinct()
                 .collect(Collectors.toList());
     }
 }

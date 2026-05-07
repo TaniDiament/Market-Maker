@@ -176,6 +176,11 @@ spec:
             # Pod-stable DNS used by peers to open the leader->worker forward.
             - name: CLUSTER_ADVERTISE_HOST
               value: "$(POD_NAME).mm-hs.market-maker.svc.cluster.local"
+            # Stable cluster id keyed off the StatefulSet pod name. Survives
+            # ZK session loss because Curator's PersistentNode recreates the
+            # member znode at the same path on reconnect.
+            - name: CLUSTER_NODE_ID
+              value: "$(POD_NAME)"
             - name: HAZELCAST_MEMBERS
               valueFrom:
                 configMapKeyRef:

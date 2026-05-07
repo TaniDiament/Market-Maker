@@ -4,7 +4,9 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import edu.yu.marketmaker.model.ExternalOrder;
 import edu.yu.marketmaker.model.Fill;
+import edu.yu.marketmaker.model.Quote;
 import edu.yu.marketmaker.model.Side;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -13,6 +15,12 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -21,9 +29,13 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
@@ -78,6 +90,33 @@ class ClusterIntegrationWithSystemK8sTest {
     private static final Set<String> SEED_SYMBOLS = new TreeSet<>(List.of(
             "AAPL", "MSFT", "GOOG", "TSLA", "NVDA", "AMZN", "META"));
 
+    private static final int TOTAL_WAVES = 50;
+    private static final long WAVE_INTERVAL_MS = 1500;
+    // Each wave per symbol: SELF_CROSS_PAIRS_PER_WAVE pairs of (BUY@P, SELL@P)
+    // at SELF_CROSS_PRICE — both orders rest inside the MM's spread and match
+    // each other, so MM exposure isn't consumed. Plus one "wide" order per
+    // wave that DOES cross the MM (BUY@101 on odd waves, SELL@99 on even),
+    // which keeps the MM engaged while balancing flow so net position oscillates
+    // around zero rather than running to the ±100 cap.
+    private static final int SELF_CROSS_PAIRS_PER_WAVE = 5;
+    private static final double SELF_CROSS_PRICE = 100.00;
+    private static final double WIDE_BUY_LIMIT = 101.00;
+    private static final double WIDE_SELL_LIMIT = 99.00;
+
+    // Mirrors marketmaker.target-spread in application-market-maker-node.properties.
+    // The production quote generator publishes ref±0.05 deterministically, so
+    // the spread should be exactly 0.10 modulo floating-point noise.
+    private static final double EXPECTED_SPREAD = 0.10;
+    private static final double SPREAD_TOLERANCE = 1e-3;
+    // Bootstrap reference is 100.00. Inventory-aware skew nudges by 0.01 per
+    // share filled, so mid drifts a bit, but the first captured MM quote
+    // should still be near the bootstrap mid.
+    private static final double MIN_REASONABLE_MID = 95.0;
+    private static final double MAX_REASONABLE_MID = 105.0;
+    // ProductionQuoteGenerator caps each side at 100 ± netQuantity, so the
+    // sum of granted bid+ask quantities cannot exceed 200 by construction.
+    private static final int MAX_QUANTITY_PER_SIDE = 200;
+
     // NodePorts defined in k8s/*.yaml.
     private static final int TRADING_STATE_PORT = 30180;
     private static final int EXCHANGE_PORT      = 30181;
@@ -122,53 +161,250 @@ class ClusterIntegrationWithSystemK8sTest {
      */
     @Test
     void ordersFlowThroughEntireSystemAndMarketMakersProduceQuotes() throws Exception {
+        // Per-symbol activity log: orders submitted (per wave aggregate, since
+        // individual orders are created server-side by the publisher), quote
+        // observations, and fills. Each entry is timestamped and the file is
+        // sorted by timestamp before flushing.
+        Map<String, List<TimedLine>> eventLog = new TreeMap<>();
+        for (String s : SEED_SYMBOLS) {
+            eventLog.put(s, new ArrayList<>());
+        }
+        Map<String, UUID> lastSeenQuoteIdBySymbol = new HashMap<>();
+        // Tracks every quoteId we've already emitted a QUOTE entry for, so we
+        // don't double-log when reconstructing missed quotes from fill records.
+        Map<String, Set<UUID>> loggedQuoteIdsBySymbol = new HashMap<>();
+        for (String s : SEED_SYMBOLS) {
+            loggedQuoteIdsBySymbol.put(s, new HashSet<>());
+        }
+
+        // /state/fills returns the entire historical fill table, so fills from
+        // prior test runs would dominate the per-symbol logs. Capture the
+        // wall-clock start of this run and use it as a lower bound when
+        // distributing fills into the per-symbol event lists. Subtract a small
+        // safety margin to forgive minor clock skew between this machine and
+        // trading-state.
+        long testStartMillis = System.currentTimeMillis() - 5_000;
+
         System.out.println("[E2E-k8s] seeding bootstrap quotes via external-publisher...");
-        Set<UUID> bootstrapQuoteIds = new HashSet<>(seedQuotes(new ArrayList<>(SEED_SYMBOLS)));
+        List<String> seedSymbolList = new ArrayList<>(SEED_SYMBOLS);
+        List<UUID> bootstrapList = seedQuotes(seedSymbolList);
+        Set<UUID> bootstrapQuoteIds = new HashSet<>(bootstrapList);
         assertEquals(SEED_SYMBOLS.size(), bootstrapQuoteIds.size(),
                 "publisher must return one quoteId per symbol");
 
-        Set<String> symbolsWithFills = new TreeSet<>();
-        Set<String> symbolsWithMmQuote = new TreeSet<>();
+        long seedTime = System.currentTimeMillis();
+        for (int i = 0; i < seedSymbolList.size(); i++) {
+            String sym = seedSymbolList.get(i);
+            UUID id = bootstrapList.get(i);
+            Quote bq = currentExchangeQuote(sym);
+            String detail = (bq != null && id.equals(bq.quoteId()))
+                    ? formatQuoteFields(bq)
+                    : "(details unavailable)";
+            eventLog.get(sym).add(new TimedLine(seedTime,
+                    "QUOTE [bootstrap] id=" + id + " " + detail));
+            lastSeenQuoteIdBySymbol.put(sym, id);
+            loggedQuoteIdsBySymbol.get(sym).add(id);
+        }
 
-        Instant deadline = Instant.now().plus(Duration.ofMinutes(3));
-        int wave = 0;
-        while (Instant.now().isBefore(deadline)) {
-            wave++;
-            int accepted = submitOrders(new ArrayList<>(SEED_SYMBOLS), 25);
+        // Fixed wave count keeps the test deterministic regardless of how
+        // quickly fills propagate. 50 waves of 25 orders × 7 symbols is far
+        // more than enough for every symbol's assigned MM to react.
+        //
+        // We capture the FIRST MM-generated quote we observe per symbol (rather
+        // than reading the live quote after all 50 waves). After heavy drain
+        // an MM may legitimately publish a paused quote with 0 quantity; we
+        // want to validate the structurally-meaningful first publish, which
+        // is what proves the production-quote-generator is working.
+        Set<String> symbolsWithFills = new TreeSet<>();
+        Map<String, Quote> firstMmQuoteBySymbol = new TreeMap<>();
+        Random rnd = new Random(0xC0FFEE);
+        for (int wave = 1; wave <= TOTAL_WAVES; wave++) {
+            long waveStart = System.currentTimeMillis();
+            int accepted = 0;
+            for (String symbol : SEED_SYMBOLS) {
+                // SELF_CROSS_PAIRS_PER_WAVE pairs at SELF_CROSS_PRICE — both
+                // orders rest inside the MM's spread; SELL matches the resting
+                // BUY, MM is not the counterparty.
+                int pairsAccepted = 0;
+                for (int i = 0; i < SELF_CROSS_PAIRS_PER_WAVE; i++) {
+                    int qty = 1 + rnd.nextInt(3);
+                    if (postOrderToExchange(new ExternalOrder(
+                            UUID.randomUUID(), symbol, qty, SELF_CROSS_PRICE, Side.BUY))) {
+                        accepted++;
+                    }
+                    if (postOrderToExchange(new ExternalOrder(
+                            UUID.randomUUID(), symbol, qty, SELF_CROSS_PRICE, Side.SELL))) {
+                        accepted++;
+                        pairsAccepted++;
+                    }
+                }
+                // One wide order whose side alternates per wave keeps MM's
+                // net position oscillating around zero.
+                Side wideSide = (wave % 2 == 1) ? Side.BUY : Side.SELL;
+                double wideLimit = wideSide == Side.BUY ? WIDE_BUY_LIMIT : WIDE_SELL_LIMIT;
+                int wideQty = 1 + rnd.nextInt(3);
+                boolean wideAccepted = postOrderToExchange(new ExternalOrder(
+                        UUID.randomUUID(), symbol, wideQty, wideLimit, wideSide));
+                if (wideAccepted) accepted++;
+
+                eventLog.get(symbol).add(new TimedLine(waveStart,
+                        "ORDERS wave=" + wave
+                                + " self-cross=" + pairsAccepted + "/" + SELF_CROSS_PAIRS_PER_WAVE
+                                + "pairs@" + String.format("%.2f", SELF_CROSS_PRICE)
+                                + " wide=" + wideSide + "@" + String.format("%.2f", wideLimit)
+                                + " qty=" + wideQty
+                                + (wideAccepted ? "" : " (rejected)")));
+            }
             System.out.println("[E2E-k8s] wave " + wave + ": exchange accepted " + accepted + " orders");
 
             for (String symbol : SEED_SYMBOLS) {
                 if (!symbolsWithFills.contains(symbol) && hasNonZeroPosition(symbol)) {
                     symbolsWithFills.add(symbol);
                 }
-                if (!symbolsWithMmQuote.contains(symbol)) {
-                    UUID currentId = currentExchangeQuoteId(symbol);
-                    if (currentId != null && !bootstrapQuoteIds.contains(currentId)) {
-                        symbolsWithMmQuote.add(symbol);
+                Quote quote = currentExchangeQuote(symbol);
+                if (quote != null && !quote.quoteId().equals(lastSeenQuoteIdBySymbol.get(symbol))) {
+                    long now = System.currentTimeMillis();
+                    String origin = bootstrapQuoteIds.contains(quote.quoteId()) ? "bootstrap" : "mm";
+                    eventLog.get(symbol).add(new TimedLine(now,
+                            "QUOTE [" + origin + "] id=" + quote.quoteId() + " " + formatQuoteFields(quote)));
+                    lastSeenQuoteIdBySymbol.put(symbol, quote.quoteId());
+                    loggedQuoteIdsBySymbol.get(symbol).add(quote.quoteId());
+                    if (!firstMmQuoteBySymbol.containsKey(symbol)
+                            && !bootstrapQuoteIds.contains(quote.quoteId())) {
+                        firstMmQuoteBySymbol.put(symbol, quote);
                     }
                 }
             }
-
-            if (symbolsWithFills.equals(SEED_SYMBOLS) && !symbolsWithMmQuote.isEmpty()) {
-                break;
-            }
-            Thread.sleep(1500);
+            Thread.sleep(WAVE_INTERVAL_MS);
         }
 
+        // Fold this run's fills into per-symbol logs. Each fill carries its
+        // real createdAt timestamp from trading-state; we drop anything older
+        // than the test's start time to avoid including fills accumulated by
+        // prior runs in the persistent postgres table.
+        // We also bucket fills by (symbol, quoteId) so we can synthesize a
+        // QUOTE entry for any quoteId that only appears in fills (the MM
+        // republished faster than the test polled).
+        Map<String, Map<UUID, List<Fill>>> fillsByQuoteIdBySymbol = new TreeMap<>();
+        for (String s : SEED_SYMBOLS) {
+            fillsByQuoteIdBySymbol.put(s, new LinkedHashMap<>());
+        }
+        for (Fill fill : getAllFills()) {
+            if (fill.createdAt() < testStartMillis) continue;
+            List<TimedLine> log = eventLog.get(fill.symbol());
+            if (log == null) continue;
+            log.add(new TimedLine(fill.createdAt(),
+                    "FILL orderId=" + fill.orderId() + " side=" + fill.side()
+                            + " qty=" + fill.quantity() + " price=" + fill.price()
+                            + " quoteId=" + fill.quoteId()));
+            fillsByQuoteIdBySymbol.get(fill.symbol())
+                    .computeIfAbsent(fill.quoteId(), k -> new ArrayList<>())
+                    .add(fill);
+        }
+
+        // Reconstruct QUOTE entries for any quoteId we only saw in fill data.
+        // ProductionQuoteGenerator publishes faster than this test polls, so
+        // many MM-published quoteIds are referenced by fills but never appear
+        // in our poll-based QUOTE entries.
+        //
+        // Side semantics in fills (from inspection of the data + the price
+        // bands the publisher uses): fill.side reflects the MM's side of the
+        // trade. fill.side=SELL → MM's ask was hit; fill.side=BUY → MM's bid
+        // was hit. So a SELL fill's price is the quote's ask, a BUY fill's
+        // price is the quote's bid. With both sides represented, we recover
+        // both legs of the quote; otherwise we mark the missing side '?'.
+        for (String symbol : SEED_SYMBOLS) {
+            Set<UUID> loggedIds = loggedQuoteIdsBySymbol.get(symbol);
+            for (Map.Entry<UUID, List<Fill>> entry
+                    : fillsByQuoteIdBySymbol.get(symbol).entrySet()) {
+                UUID qid = entry.getKey();
+                if (loggedIds.contains(qid)) continue;
+                List<Fill> fills = entry.getValue();
+                long earliest = Long.MAX_VALUE;
+                Double bid = null;
+                Double ask = null;
+                for (Fill f : fills) {
+                    if (f.createdAt() < earliest) earliest = f.createdAt();
+                    if (f.side() == Side.SELL && ask == null) ask = f.price();
+                    else if (f.side() == Side.BUY && bid == null) bid = f.price();
+                }
+                String bidStr = bid == null ? "?" : String.format("%.4f", bid);
+                String askStr = ask == null ? "?" : String.format("%.4f", ask);
+                eventLog.get(symbol).add(new TimedLine(earliest,
+                        "QUOTE [from-fill] id=" + qid + " bid=" + bidStr + " ask=" + askStr
+                                + " (inferred from " + fills.size() + " fill"
+                                + (fills.size() == 1 ? "" : "s") + ")"));
+                loggedIds.add(qid);
+            }
+        }
+
+        writePerSymbolLogs(eventLog);
+
         System.out.println("[E2E-k8s] symbols with fills: " + symbolsWithFills);
-        System.out.println("[E2E-k8s] symbols with MM-generated quote in exchange: " + symbolsWithMmQuote);
+        System.out.println("[E2E-k8s] symbols with MM-generated quote in exchange: " + firstMmQuoteBySymbol.keySet());
 
         assertEquals(SEED_SYMBOLS, symbolsWithFills,
                 "every seed symbol must have at least one fill in trading-state; "
                         + "proves external-publisher → exchange → trading-state wiring");
-        assertFalse(symbolsWithMmQuote.isEmpty(),
-                "at least one symbol must have a current exchange quote whose quoteId "
-                        + "is not in the bootstrap set; proves a market-maker wrote a quote "
-                        + "back via the shared Hazelcast quotes map. bootstrap ids="
+        assertEquals(SEED_SYMBOLS, firstMmQuoteBySymbol.keySet(),
+                "after " + TOTAL_WAVES + " waves every seed symbol must have produced "
+                        + "an exchange quote whose quoteId is not in the bootstrap set; "
+                        + "proves each symbol's assigned market-maker wrote a quote back "
+                        + "via the shared Hazelcast quotes map. bootstrap ids="
                         + bootstrapQuoteIds);
 
-        List<Fill> allFills = getAllFills();
-        assertFalse(allFills.isEmpty(), "trading-state /state/fills returned no fills");
+        // Per-symbol quote-content assertions on the first MM-generated quote
+        // observed for each symbol: prove the MM is publishing structurally
+        // valid quotes (correct symbol, positive prices/qty, non-crossed bid/ask).
+        for (String symbol : SEED_SYMBOLS) {
+            Quote quote = firstMmQuoteBySymbol.get(symbol);
+            assertNotNull(quote, "no MM-generated quote captured for " + symbol);
+            assertEquals(symbol, quote.symbol(),
+                    "quote.symbol must match requested symbol: " + quote);
+            assertFalse(bootstrapQuoteIds.contains(quote.quoteId()),
+                    "quote.quoteId must not be a bootstrap id (i.e. an MM wrote it): " + quote);
+            assertTrue(quote.bidPrice() > 0.0, "quote.bidPrice must be > 0: " + quote);
+            assertTrue(quote.askPrice() > 0.0, "quote.askPrice must be > 0: " + quote);
+            // Quantities can be 0 — a 0-qty side means the MM has hit its
+            // exposure cap on that side and is signalling "do not match here".
+            // A fully 0×0 quote is also valid: the MM is paused on both sides.
+            // What we don't allow is a negative quantity.
+            assertTrue(quote.bidQuantity() >= 0, "quote.bidQuantity must be >= 0: " + quote);
+            assertTrue(quote.askQuantity() >= 0, "quote.askQuantity must be >= 0: " + quote);
+            assertTrue(quote.bidPrice() <= quote.askPrice(),
+                    "bid must not cross ask: " + quote);
+            assertTrue(quote.expiresAt() > 0, "quote.expiresAt must be > 0: " + quote);
+
+            // Spread must match the configured target. ProductionQuoteGenerator
+            // computes bid/ask as ref±halfSpread, so this is exact.
+            double spread = quote.askPrice() - quote.bidPrice();
+            assertEquals(EXPECTED_SPREAD, spread, SPREAD_TOLERANCE,
+                    "spread must equal marketmaker.target-spread (" + EXPECTED_SPREAD + "): " + quote);
+
+            // Mid-price must stay near the bootstrap reference (100). Drifts
+            // a fraction per fill via inventory skew but should never wander
+            // far on the first observed MM quote.
+            double mid = (quote.bidPrice() + quote.askPrice()) / 2.0;
+            assertTrue(mid >= MIN_REASONABLE_MID && mid <= MAX_REASONABLE_MID,
+                    "mid (" + mid + ") must be in [" + MIN_REASONABLE_MID + ", "
+                            + MAX_REASONABLE_MID + "]: " + quote);
+
+            // Each side is capped by 100 ± netQuantity; reservation can only
+            // shrink that. So neither side may exceed 200.
+            assertTrue(quote.bidQuantity() <= MAX_QUANTITY_PER_SIDE,
+                    "bidQuantity must be <= " + MAX_QUANTITY_PER_SIDE + ": " + quote);
+            assertTrue(quote.askQuantity() <= MAX_QUANTITY_PER_SIDE,
+                    "askQuantity must be <= " + MAX_QUANTITY_PER_SIDE + ": " + quote);
+        }
+
+        List<Fill> allFills = new ArrayList<>();
+        for (Fill fill : getAllFills()) {
+            if (fill.createdAt() >= testStartMillis) {
+                allFills.add(fill);
+            }
+        }
+        assertFalse(allFills.isEmpty(),
+                "trading-state /state/fills returned no fills from this run (after " + testStartMillis + ")");
 
         Set<String> symbolsSeenInFills = new TreeSet<>();
         Map<String, Long> signedNetBySymbolFromFills = new TreeMap<>();
@@ -320,22 +556,6 @@ class ClusterIntegrationWithSystemK8sTest {
         return JSON.readValue(resp.body(), new TypeReference<List<UUID>>() {});
     }
 
-    private static int submitOrders(List<String> symbols, int count) throws Exception {
-        String body = JSON.writeValueAsString(symbols);
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create("http://" + HOST + ":" + PUBLISHER_PORT
-                        + "/publisher/submit-orders?count=" + count))
-                .header("Content-Type", "application/json")
-                .timeout(Duration.ofSeconds(60))
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build();
-        HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() != 200) {
-            fail("submit-orders returned " + resp.statusCode() + ": " + resp.body());
-        }
-        return Integer.parseInt(resp.body().trim());
-    }
-
     private static List<Fill> getAllFills() throws Exception {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create("http://" + HOST + ":" + TRADING_STATE_PORT + "/state/fills"))
@@ -368,7 +588,58 @@ class ClusterIntegrationWithSystemK8sTest {
         }
     }
 
-    private static UUID currentExchangeQuoteId(String symbol) {
+    /**
+     * Submit a single order directly to the exchange's /orders endpoint.
+     * Returns true on HTTP 200 (the exchange accepted the order — it may have
+     * filled, partially filled, or been booked). Returns false on any non-200
+     * or transport error; we tally those as rejected for the wave summary.
+     */
+    private static boolean postOrderToExchange(ExternalOrder order) {
+        try {
+            String body = JSON.writeValueAsString(order);
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("http://" + HOST + ":" + EXCHANGE_PORT + "/orders"))
+                    .header("Content-Type", "application/json")
+                    .timeout(Duration.ofSeconds(10))
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+            return resp.statusCode() == 200;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** A single chronologically-ordered event line in a per-symbol log. */
+    private record TimedLine(long epochMillis, String text) {}
+
+    private static final DateTimeFormatter LOG_TS = DateTimeFormatter
+            .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+            .withZone(ZoneOffset.UTC);
+
+    private static String formatQuoteFields(Quote q) {
+        return String.format("bid=%.4f@%d ask=%.4f@%d expires=%d",
+                q.bidPrice(), q.bidQuantity(), q.askPrice(), q.askQuantity(), q.expiresAt());
+    }
+
+    private static void writePerSymbolLogs(Map<String, List<TimedLine>> eventLog) throws IOException {
+        Path dir = Paths.get("target", "integration-logs");
+        Files.createDirectories(dir);
+        for (Map.Entry<String, List<TimedLine>> entry : eventLog.entrySet()) {
+            String symbol = entry.getKey();
+            List<TimedLine> lines = new ArrayList<>(entry.getValue());
+            lines.sort(Comparator.comparingLong(TimedLine::epochMillis));
+            List<String> rendered = new ArrayList<>(lines.size());
+            for (TimedLine line : lines) {
+                rendered.add(LOG_TS.format(Instant.ofEpochMilli(line.epochMillis())) + " " + line.text());
+            }
+            Path file = dir.resolve(symbol + ".log");
+            Files.write(file, rendered);
+            System.out.println("[E2E-k8s] wrote " + lines.size() + " events to " + file.toAbsolutePath());
+        }
+    }
+
+    private static Quote currentExchangeQuote(String symbol) {
         try {
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create("http://" + HOST + ":" + EXCHANGE_PORT + "/quotes/" + symbol))
@@ -376,9 +647,9 @@ class ClusterIntegrationWithSystemK8sTest {
                     .GET().build();
             HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() != 200) return null;
-            JsonNode node = JSON.readTree(resp.body());
-            String id = node.path("quoteId").asText(null);
-            return id == null ? null : UUID.fromString(id);
+            return JSON.copy()
+                    .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+                    .readValue(resp.body(), Quote.class);
         } catch (Exception e) {
             return null;
         }

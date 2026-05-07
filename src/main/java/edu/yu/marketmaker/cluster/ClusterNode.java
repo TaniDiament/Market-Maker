@@ -7,6 +7,7 @@ import jakarta.annotation.PreDestroy;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.recipes.cache.CuratorCache;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
+import org.apache.curator.framework.recipes.nodes.PersistentNode;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
@@ -19,6 +20,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Cluster membership and identity for a single market-maker JVM.
@@ -53,6 +55,7 @@ public class ClusterNode {
     private volatile String memberZnodePath;
     private LeaderLatch leaderLatch;
     private CuratorCache membersCache;
+    private PersistentNode persistentMember;
 
     public ClusterNode(CuratorFramework curator, ZkPaths paths, ClusterProperties props) {
         this.curator = curator;
@@ -78,12 +81,34 @@ public class ClusterNode {
         byte[] memberData = mapper.writeValueAsBytes(Map.of(
                 "host", props.getAdvertiseHost(),
                 "forwardPort", props.getForwardPort()));
-        this.memberZnodePath = curator.create()
-                .creatingParentsIfNeeded()
-                .withMode(CreateMode.EPHEMERAL_SEQUENTIAL)
-                .forPath(paths.memberNodePrefix(), memberData);
-        this.nodeId = memberZnodePath.substring(memberZnodePath.lastIndexOf('/') + 1);
-        log.info("registered cluster member id={} at {}", nodeId, memberZnodePath);
+
+        String configuredId = props.getNodeId();
+        if (configuredId != null && !configuredId.isBlank()) {
+            // Stable id: deterministic znode path that Curator's PersistentNode
+            // recreates after every ZK reconnect. Without this, a session loss
+            // (or a ZK pod restart) silently strips this node from
+            // /marketmaker/members and the next rebalance excludes it.
+            this.nodeId = configuredId.trim();
+            this.memberZnodePath = paths.members() + "/" + nodeId;
+            this.persistentMember = new PersistentNode(
+                    curator, CreateMode.EPHEMERAL, /*useProtection*/ false,
+                    memberZnodePath, memberData);
+            this.persistentMember.start();
+            if (!this.persistentMember.waitForInitialCreate(30, TimeUnit.SECONDS)) {
+                throw new ClusterException("timed out registering member znode at " + memberZnodePath);
+            }
+            log.info("registered cluster member id={} at {} (persistent)", nodeId, memberZnodePath);
+        } else {
+            // Legacy fallback: ephemeral-sequential, used by unit tests against
+            // a TestingServer that don't set cluster.node-id. Loses re-registration
+            // on session reset, but those tests don't exercise reconnect.
+            this.memberZnodePath = curator.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.EPHEMERAL_SEQUENTIAL)
+                    .forPath(paths.memberNodePrefix(), memberData);
+            this.nodeId = memberZnodePath.substring(memberZnodePath.lastIndexOf('/') + 1);
+            log.info("registered cluster member id={} at {} (ephemeral-sequential)", nodeId, memberZnodePath);
+        }
 
         this.membersCache = CuratorCache.build(curator, paths.members());
         this.membersCache.start();
@@ -204,12 +229,22 @@ public class ClusterNode {
         } catch (Exception e) {
             log.warn("error closing members cache", e);
         }
-        try {
-            if (memberZnodePath != null && curator.getZookeeperClient().isConnected()) {
-                curator.delete().guaranteed().forPath(memberZnodePath);
+        // PersistentNode closes its own ephemeral on shutdown. For the legacy
+        // path we still delete explicitly so peers see us leave immediately.
+        if (persistentMember != null) {
+            try {
+                persistentMember.close();
+            } catch (Exception e) {
+                log.debug("error closing persistent member node", e);
             }
-        } catch (Exception e) {
-            log.debug("member znode delete on shutdown failed (likely already gone)", e);
+        } else {
+            try {
+                if (memberZnodePath != null && curator.getZookeeperClient().isConnected()) {
+                    curator.delete().guaranteed().forPath(memberZnodePath);
+                }
+            } catch (Exception e) {
+                log.debug("member znode delete on shutdown failed (likely already gone)", e);
+            }
         }
     }
 }

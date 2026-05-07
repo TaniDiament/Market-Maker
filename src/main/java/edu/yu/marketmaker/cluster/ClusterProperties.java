@@ -18,6 +18,7 @@ public class ClusterProperties {
     private int connectionTimeoutMs = 5_000;
     private String advertiseHost = "localhost";
     private int forwardPort = 7001;
+    private String nodeId = "";
 
     /** @return the ZK connection string ({@code host:port[,host:port...]}). */
     public String getZookeeperConnect() {
@@ -84,5 +85,20 @@ public class ClusterProperties {
 
     public void setForwardPort(int forwardPort) {
         this.forwardPort = forwardPort;
+    }
+
+    /**
+     * @return stable cluster id for this JVM. When set (e.g. to {@code POD_NAME}
+     *         in k8s or the service hostname in compose), the member znode is
+     *         created at a fixed path and recreated automatically by Curator
+     *         after ZK session loss. When blank, the legacy ephemeral-sequential
+     *         path is used (useful for unit tests against a {@code TestingServer}).
+     */
+    public String getNodeId() {
+        return nodeId;
+    }
+
+    public void setNodeId(String nodeId) {
+        this.nodeId = nodeId == null ? "" : nodeId;
     }
 }

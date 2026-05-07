@@ -164,6 +164,7 @@ services:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-1
+      - CLUSTER_NODE_ID=market-maker-node-1
       - HAZELCAST_MEMBERS=trading-state,exchange,exposure-reservation,external-publisher,market-maker-node-1,market-maker-node-2,market-maker-node-3,market-maker-node-4,market-maker-node-5,market-maker-node-6,market-maker-node-7
     ports:
       - "8081:8080"
@@ -186,6 +187,7 @@ services:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-2
+      - CLUSTER_NODE_ID=market-maker-node-2
       - HAZELCAST_MEMBERS=trading-state,exchange,exposure-reservation,external-publisher,market-maker-node-1,market-maker-node-2,market-maker-node-3,market-maker-node-4,market-maker-node-5,market-maker-node-6,market-maker-node-7
     ports:
       - "8082:8080"
@@ -208,6 +210,7 @@ services:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-3
+      - CLUSTER_NODE_ID=market-maker-node-3
       - HAZELCAST_MEMBERS=trading-state,exchange,exposure-reservation,external-publisher,market-maker-node-1,market-maker-node-2,market-maker-node-3,market-maker-node-4,market-maker-node-5,market-maker-node-6,market-maker-node-7
     ports:
       - "8083:8080"
@@ -230,6 +233,7 @@ services:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-4
+      - CLUSTER_NODE_ID=market-maker-node-4
       - HAZELCAST_MEMBERS=trading-state,exchange,exposure-reservation,external-publisher,market-maker-node-1,market-maker-node-2,market-maker-node-3,market-maker-node-4,market-maker-node-5,market-maker-node-6,market-maker-node-7
     ports:
       - "8084:8080"
@@ -252,6 +256,7 @@ services:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-5
+      - CLUSTER_NODE_ID=market-maker-node-5
       - HAZELCAST_MEMBERS=trading-state,exchange,exposure-reservation,external-publisher,market-maker-node-1,market-maker-node-2,market-maker-node-3,market-maker-node-4,market-maker-node-5,market-maker-node-6,market-maker-node-7
     ports:
       - "8085:8080"
@@ -274,6 +279,7 @@ services:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-6
+      - CLUSTER_NODE_ID=market-maker-node-6
       - HAZELCAST_MEMBERS=trading-state,exchange,exposure-reservation,external-publisher,market-maker-node-1,market-maker-node-2,market-maker-node-3,market-maker-node-4,market-maker-node-5,market-maker-node-6,market-maker-node-7
     ports:
       - "8086:8080"
@@ -296,6 +302,7 @@ services:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
       - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-7
+      - CLUSTER_NODE_ID=market-maker-node-7
       - HAZELCAST_MEMBERS=trading-state,exchange,exposure-reservation,external-publisher,market-maker-node-1,market-maker-node-2,market-maker-node-3,market-maker-node-4,market-maker-node-5,market-maker-node-6,market-maker-node-7
     ports:
       - "8087:8080"

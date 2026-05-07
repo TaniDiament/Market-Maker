@@ -87,3 +87,18 @@ spec:
               command: ["sh", "-c", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
             initialDelaySeconds: 30
             periodSeconds: 10
+          # Without persistent storage, every pod restart wipes all znodes
+          # (zxid resets to 0x0). That cascades into total cluster-state
+          # loss — leader latch, members, assignments, the symbol list.
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi
