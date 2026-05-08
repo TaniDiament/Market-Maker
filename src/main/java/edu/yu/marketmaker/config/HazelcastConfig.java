@@ -10,6 +10,7 @@ import edu.yu.marketmaker.model.*;
 import edu.yu.marketmaker.exposurereservation.ExposureReservationService;
 import edu.yu.marketmaker.persistence.*;
 import edu.yu.marketmaker.persistence.interfaces.*;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.*;
 import com.hazelcast.config.TcpIpConfig;
 
@@ -21,7 +22,11 @@ import java.util.UUID;
  * backed by PostgreSQL for data persistence.
  */
 @Configuration
+@Profile("!external-publisher & !position-ui")
 public class HazelcastConfig {
+
+    @Value("${hazelcast.members:trading-state,exchange,exposure-reservation}")
+    private String hazelcastMembers;
 
     private static final String POSITIONS_MAP_NAME = "positions";
     private static final String FILLS_MAP_NAME = "fills";
@@ -163,10 +168,12 @@ private void configureNetwork(Config config) {
     // Hazelcast will try each until it finds another cluster member.
     TcpIpConfig tcpConfig = joinConfig.getTcpIpConfig();
     tcpConfig.setEnabled(true);
-    tcpConfig.addMember("trading-state");
-    tcpConfig.addMember("exchange");
-    tcpConfig.addMember("exposure-reservation");
-    tcpConfig.addMember("position-ui");
+    for (String member : hazelcastMembers.split(",")) {
+        String trimmed = member.trim();
+        if (!trimmed.isEmpty()) {
+            tcpConfig.addMember(trimmed);
+        }
+    }
 
     // Bind to all interfaces so other members can connect to this JVM
     networkConfig.getInterfaces().setEnabled(false);

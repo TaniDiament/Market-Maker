@@ -117,8 +117,10 @@ class ClusterIntegrationWithSystemTest {
         int rcCore = runDocker(Map.of("QUOTE_GENERATOR_PROFILE", "production-quote-generator"),
                 TimeUnit.MINUTES.toMillis(5),
                 "compose", "up", "-d",
-                "zookeeper1", "zookeeper2", "zookeeper3",
-                "postgres", "trading-state", "exposure-reservation");
+                "zookeeper1", "zookeeper2", "zookeeper3", "postgres",
+                "trading-state-1", "trading-state-2", "trading-state-3",
+                "exposure-reservation-1", "exposure-reservation-2", "exposure-reservation-3",
+                "service-lb");
         assertEquals(0, rcCore, "docker compose up (core) failed");
 
         awaitHealthy("trading-state", TRADING_STATE_PORT, Duration.ofMinutes(4));
@@ -127,7 +129,7 @@ class ClusterIntegrationWithSystemTest {
         System.out.println("[E2E] bringing up exchange...");
         int rcExchange = runDocker(Map.of("QUOTE_GENERATOR_PROFILE", "production-quote-generator"),
                 TimeUnit.MINUTES.toMillis(3),
-                "compose", "up", "-d", "exchange");
+                "compose", "up", "-d", "exchange-1", "exchange-2", "exchange-3");
         assertEquals(0, rcExchange, "docker compose up (exchange) failed");
         awaitHealthy("exchange", EXCHANGE_PORT, Duration.ofMinutes(4));
 
@@ -147,8 +149,8 @@ class ClusterIntegrationWithSystemTest {
         assertEquals(0, rcMm, "docker compose up (market-maker nodes) failed");
 
         System.out.println("[E2E] waiting for 7-node cluster convergence...");
-        awaitCondition(Duration.ofMinutes(4), ClusterIntegrationWithSystemTest::allNodesConverged,
-                "cluster did not converge within 4 minutes");
+        awaitCondition(Duration.ofMinutes(8), ClusterIntegrationWithSystemTest::allNodesConverged,
+                "cluster did not converge within 8 minutes");
         System.out.println("[E2E] full stack up.");
     }
 

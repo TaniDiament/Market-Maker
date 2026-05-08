@@ -8,6 +8,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -31,6 +32,7 @@ import java.util.UUID;
  * </ul>
  */
 @Configuration
+@Profile("!market-maker-node")
 public class HighAvailabilityConfig {
 
     @Bean(initMethod = "start", destroyMethod = "close")
@@ -44,11 +46,6 @@ public class HighAvailabilityConfig {
                 .connectionTimeoutMs(5_000)
                 .retryPolicy(retry)
                 .build();
-    }
-
-    @Bean
-    public ServiceRegistry serviceRegistry(CuratorFramework curator) {
-        return new ServiceRegistry(curator);
     }
 
     /**

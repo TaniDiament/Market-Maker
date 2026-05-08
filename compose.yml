@@ -1,12 +1,47 @@
 services:
-  zookeeper:
+  zookeeper1:
     image: zookeeper:3.9
+    hostname: zookeeper1
     environment:
-      - ZOO_4LW_COMMANDS_WHITELIST=mntr,srvr,ruok,stat
+      - ZOO_MY_ID=1
+      - ZOO_SERVERS=server.1=zookeeper1:2888:3888;2181 server.2=zookeeper2:2888:3888;2181 server.3=zookeeper3:2888:3888;2181
+      - ZOO_4LW_COMMANDS_WHITELIST=srvr,ruok,mntr,stat,conf
     ports:
       - "2181:2181"
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  zookeeper2:
+    image: zookeeper:3.9
+    hostname: zookeeper2
+    environment:
+      - ZOO_MY_ID=2
+      - ZOO_SERVERS=server.1=zookeeper1:2888:3888;2181 server.2=zookeeper2:2888:3888;2181 server.3=zookeeper3:2888:3888;2181
+      - ZOO_4LW_COMMANDS_WHITELIST=srvr,ruok,mntr,stat,conf
+    ports:
+      - "2182:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  zookeeper3:
+    image: zookeeper:3.9
+    hostname: zookeeper3
+    environment:
+      - ZOO_MY_ID=3
+      - ZOO_SERVERS=server.1=zookeeper1:2888:3888;2181 server.2=zookeeper2:2888:3888;2181 server.3=zookeeper3:2888:3888;2181
+      - ZOO_4LW_COMMANDS_WHITELIST=srvr,ruok,mntr,stat,conf
+    ports:
+      - "2183:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -27,70 +62,234 @@ services:
       retries: 10
       start_period: 10s
 
-  trading-state:
+  # ------------------------------------------------------------------
+  # Hazelcast cluster: trading-state, exchange, exposure-reservation each
+  # run as 3 explicit replicas. Each replica needs a distinct hostname
+  # because Hazelcast uses the advertise host as member identity — sharing
+  # one hostname across replicas causes a perpetual split-brain. Replicas
+  # share a network alias so other services can still reach the role by
+  # the bare name (DNS round-robins across all 3 IPs).
+  # ------------------------------------------------------------------
+  trading-state-1:
     image: market-maker
     build: .
+    hostname: trading-state-1
+    networks:
+      default:
+        aliases:
+          - trading-state
     environment:
       - SPRING_PROFILES_ACTIVE=trading-state
-      - HA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - HA_SERVICE_NAME=trading-state
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=trading-state-1
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
     depends_on:
-      postgres:
-        condition: service_healthy
-      zookeeper:
-        condition: service_healthy
-    deploy:
-      replicas: 3
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
 
-  exchange:
+  trading-state-2:
     image: market-maker
     build: .
+    hostname: trading-state-2
+    networks:
+      default:
+        aliases:
+          - trading-state
+    environment:
+      - SPRING_PROFILES_ACTIVE=trading-state
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=trading-state-2
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
+    depends_on:
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
+
+  trading-state-3:
+    image: market-maker
+    build: .
+    hostname: trading-state-3
+    networks:
+      default:
+        aliases:
+          - trading-state
+    environment:
+      - SPRING_PROFILES_ACTIVE=trading-state
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=trading-state-3
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
+    depends_on:
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
+
+  exchange-1:
+    image: market-maker
+    build: .
+    hostname: exchange-1
+    networks:
+      default:
+        aliases:
+          - exchange
     environment:
       - SPRING_PROFILES_ACTIVE=exchange
-      - HA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - HA_SERVICE_NAME=exchange
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=exchange-1
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
     depends_on:
-      postgres:
-        condition: service_healthy
-      zookeeper:
-        condition: service_healthy
-    deploy:
-      replicas: 3
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
 
-  exposure-reservation:
+  exchange-2:
     image: market-maker
     build: .
+    hostname: exchange-2
+    networks:
+      default:
+        aliases:
+          - exchange
+    environment:
+      - SPRING_PROFILES_ACTIVE=exchange
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=exchange-2
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
+    depends_on:
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
+
+  exchange-3:
+    image: market-maker
+    build: .
+    hostname: exchange-3
+    networks:
+      default:
+        aliases:
+          - exchange
+    environment:
+      - SPRING_PROFILES_ACTIVE=exchange
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=exchange-3
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
+    depends_on:
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
+
+  exposure-reservation-1:
+    image: market-maker
+    build: .
+    hostname: exposure-reservation-1
+    networks:
+      default:
+        aliases:
+          - exposure-reservation
     environment:
       - SPRING_PROFILES_ACTIVE=exposure-reservation
-      - HA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - HA_SERVICE_NAME=exposure-reservation
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=exposure-reservation-1
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
     depends_on:
-      postgres:
-        condition: service_healthy
-      zookeeper:
-        condition: service_healthy
-    deploy:
-      replicas: 3
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
+
+  exposure-reservation-2:
+    image: market-maker
+    build: .
+    hostname: exposure-reservation-2
+    networks:
+      default:
+        aliases:
+          - exposure-reservation
+    environment:
+      - SPRING_PROFILES_ACTIVE=exposure-reservation
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=exposure-reservation-2
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
+    depends_on:
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
+
+  exposure-reservation-3:
+    image: market-maker
+    build: .
+    hostname: exposure-reservation-3
+    networks:
+      default:
+        aliases:
+          - exposure-reservation
+    environment:
+      - SPRING_PROFILES_ACTIVE=exposure-reservation
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+      - HA_ADVERTISE_HOST=exposure-reservation-3
+      - HAZELCAST_MEMBERS=trading-state-1,trading-state-2,trading-state-3,exchange-1,exchange-2,exchange-3,exposure-reservation-1,exposure-reservation-2,exposure-reservation-3
+    depends_on:
+      postgres: { condition: service_healthy }
+      zookeeper1: { condition: service_healthy }
+      zookeeper2: { condition: service_healthy }
+      zookeeper3: { condition: service_healthy }
 
   position-ui:
     image: market-maker
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=position-ui
-      - HA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - HA_SERVICE_NAME=position-ui
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
     deploy:
       replicas: 3
+
+  service-lb:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "18080:18080"
+      - "18081:18081"
+      - "18082:18082"
+
+  external-publisher:
+    image: market-maker
+    build: .
+    environment:
+      - SPRING_PROFILES_ACTIVE=external-publisher
+      - EXCHANGE_BASE_URL=http://exchange:8080
+      - HA_ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
+    ports:
+      - "18083:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      exchange-1:
+        condition: service_started
+    deploy:
+      replicas: 1
 
   market-maker-node-1:
     image: market-maker
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
-      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-1
       - CLUSTER_NODE_ID=market-maker-node-1
     ports:
@@ -98,7 +297,11 @@ services:
     volumes:
       - ./config/symbols.txt:/config/symbols.txt:ro
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -108,7 +311,7 @@ services:
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
-      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-2
       - CLUSTER_NODE_ID=market-maker-node-2
     ports:
@@ -116,7 +319,11 @@ services:
     volumes:
       - ./config/symbols.txt:/config/symbols.txt:ro
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -126,7 +333,7 @@ services:
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
-      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-3
       - CLUSTER_NODE_ID=market-maker-node-3
     ports:
@@ -134,7 +341,11 @@ services:
     volumes:
       - ./config/symbols.txt:/config/symbols.txt:ro
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -144,7 +355,7 @@ services:
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
-      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-4
       - CLUSTER_NODE_ID=market-maker-node-4
     ports:
@@ -152,7 +363,11 @@ services:
     volumes:
       - ./config/symbols.txt:/config/symbols.txt:ro
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -162,7 +377,7 @@ services:
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
-      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-5
       - CLUSTER_NODE_ID=market-maker-node-5
     ports:
@@ -170,7 +385,11 @@ services:
     volumes:
       - ./config/symbols.txt:/config/symbols.txt:ro
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -180,7 +399,7 @@ services:
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
-      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-6
       - CLUSTER_NODE_ID=market-maker-node-6
     ports:
@@ -188,7 +407,11 @@ services:
     volumes:
       - ./config/symbols.txt:/config/symbols.txt:ro
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -198,7 +421,7 @@ services:
     build: .
     environment:
       - SPRING_PROFILES_ACTIVE=market-maker-node,${QUOTE_GENERATOR_PROFILE:-test-quote-generator}
-      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - ZOOKEEPER_CONNECT=zookeeper1:2181,zookeeper2:2181,zookeeper3:2181
       - CLUSTER_ADVERTISE_HOST=market-maker-node-7
       - CLUSTER_NODE_ID=market-maker-node-7
     ports:
@@ -206,8 +429,11 @@ services:
     volumes:
       - ./config/symbols.txt:/config/symbols.txt:ro
     depends_on:
-      zookeeper:
+      zookeeper1:
+        condition: service_healthy
+      zookeeper2:
+        condition: service_healthy
+      zookeeper3:
         condition: service_healthy
       postgres:
         condition: service_healthy
-

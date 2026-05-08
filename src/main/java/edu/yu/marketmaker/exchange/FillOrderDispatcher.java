@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Profile;
 import org.springframework.messaging.rsocket.RSocketRequester;
 import org.springframework.stereotype.Component;
 
@@ -17,6 +18,7 @@ import edu.yu.marketmaker.model.Side;
 import java.util.UUID;
 
 @Component
+@Profile("exchange")
 public class FillOrderDispatcher implements OrderDispatcher {
 
     private static final Logger logger = LoggerFactory.getLogger(FillOrderDispatcher.class);
