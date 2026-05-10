@@ -49,6 +49,8 @@ spec:
               value: external-publisher
             - name: EXCHANGE_BASE_URL
               value: http://exchange:8080
+            - name: HA_ZOOKEEPER_CONNECT
+              value: "zk-0.zk-hs:2181,zk-1.zk-hs:2181,zk-2.zk-hs:2181"
             - name: HAZELCAST_MEMBERS
               valueFrom:
                 configMapKeyRef:

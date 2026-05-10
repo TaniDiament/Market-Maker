@@ -1,6 +1,7 @@
 package edu.yu.marketmaker.external;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import edu.yu.marketmaker.ha.ServiceRegistry;
 import edu.yu.marketmaker.model.ExternalOrder;
 import edu.yu.marketmaker.model.Quote;
 import edu.yu.marketmaker.model.Side;
@@ -8,7 +9,6 @@ import edu.yu.marketmaker.service.ServiceHealth;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Profile;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -17,6 +17,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.io.IOException;
+import java.net.ConnectException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -24,6 +26,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
 
@@ -41,21 +44,31 @@ import java.util.UUID;
  *       orders per symbol, priced to cross both the bootstrap spread and the
  *       tighter spread a {@code ProductionQuoteGenerator} will produce.</li>
  * </ul>
+ *
+ * <p>All writes target the current {@code exchange} leader — resolved from the
+ * {@link ServiceRegistry} ZK watch — rather than the round-robin
+ * {@code exchange} DNS alias, which would land on a non-leader replica 2/3 of
+ * the time and get rejected with HTTP 503 by {@code LeaderGuardFilter}. The
+ * helper retries briefly on 503 / connect failure so an in-flight failover
+ * doesn't fail user-visible requests.
  */
 @RestController
 @Profile("external-publisher")
 public class ExternalOrderPublisherController {
 
     private static final Logger logger = LoggerFactory.getLogger(ExternalOrderPublisherController.class);
+    private static final String EXCHANGE_SERVICE = "exchange";
     private static final long QUOTE_TTL_MS = 5 * 60_000L;
+    /** Total time we'll spend trying to resolve a leader / dodge a 503 before giving up on one request. */
+    private static final long LEADER_RESOLVE_BUDGET_MS = 10_000L;
+    private static final long LEADER_RESOLVE_BACKOFF_MS = 100L;
 
-    private final String exchangeBaseUrl;
+    private final ServiceRegistry serviceRegistry;
     private final ObjectMapper mapper = new ObjectMapper();
     private HttpClient http;
 
-    public ExternalOrderPublisherController(
-            @Value("${exchange.base-url:http://exchange:8080}") String exchangeBaseUrl) {
-        this.exchangeBaseUrl = exchangeBaseUrl;
+    public ExternalOrderPublisherController(ServiceRegistry serviceRegistry) {
+        this.serviceRegistry = serviceRegistry;
     }
 
     @PostConstruct
@@ -82,13 +95,7 @@ public class ExternalOrderPublisherController {
                     quoteId,
                     System.currentTimeMillis() + QUOTE_TTL_MS);
             String body = mapper.writeValueAsString(quote);
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(exchangeBaseUrl + "/quotes/" + symbol))
-                    .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(10))
-                    .PUT(HttpRequest.BodyPublishers.ofString(body))
-                    .build();
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> resp = sendToExchangeLeader("/quotes/" + symbol, "PUT", body);
             if (resp.statusCode() >= 400) {
                 throw new IllegalStateException(
                         "PUT /quotes/" + symbol + " failed: " + resp.statusCode() + " " + resp.body());
@@ -122,13 +129,7 @@ public class ExternalOrderPublisherController {
                 ExternalOrder order = new ExternalOrder(UUID.randomUUID(), symbol, quantity, limitPrice, side);
                 try {
                     String body = mapper.writeValueAsString(order);
-                    HttpRequest req = HttpRequest.newBuilder()
-                            .uri(URI.create(exchangeBaseUrl + "/orders"))
-                            .header("Content-Type", "application/json")
-                            .timeout(Duration.ofSeconds(10))
-                            .POST(HttpRequest.BodyPublishers.ofString(body))
-                            .build();
-                    HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+                    HttpResponse<String> resp = sendToExchangeLeader("/orders", "POST", body);
                     if (resp.statusCode() == 200) {
                         accepted++;
                     } else {
@@ -142,6 +143,58 @@ public class ExternalOrderPublisherController {
         }
         logger.info("Submitted orders: accepted={}, rejected={}", accepted, rejected);
         return ResponseEntity.ok(accepted);
+    }
+
+    /**
+     * Send a JSON body to the current exchange leader at {@code pathAndQuery}.
+     *
+     * <p>The exchange runs three replicas behind a Hazelcast/ZK leader latch;
+     * only the leader accepts mutating requests, the rest reply 503. The
+     * leader's hostname is published in {@link ServiceRegistry}, so we look
+     * it up per-request and retry briefly on 503 (stale registry cache during
+     * failover) or on a {@link ConnectException} (leader pod restarting).
+     *
+     * @throws IllegalStateException if no leader can be reached within {@link #LEADER_RESOLVE_BUDGET_MS}
+     */
+    private HttpResponse<String> sendToExchangeLeader(String pathAndQuery,
+                                                      String method,
+                                                      String body) throws IOException, InterruptedException {
+        long deadline = System.currentTimeMillis() + LEADER_RESOLVE_BUDGET_MS;
+        Throwable lastTransport = null;
+        int attempts = 0;
+        while (System.currentTimeMillis() < deadline) {
+            attempts++;
+            Optional<ServiceRegistry.Endpoint> leader = serviceRegistry.getLeaderAddress(EXCHANGE_SERVICE);
+            if (leader.isEmpty()) {
+                Thread.sleep(LEADER_RESOLVE_BACKOFF_MS);
+                continue;
+            }
+            URI uri = URI.create("http://" + leader.get().host + ":" + leader.get().httpPort + pathAndQuery);
+            HttpRequest.BodyPublisher publisher = body == null
+                    ? HttpRequest.BodyPublishers.noBody()
+                    : HttpRequest.BodyPublishers.ofString(body);
+            HttpRequest.Builder b = HttpRequest.newBuilder(uri)
+                    .header("Content-Type", "application/json")
+                    .timeout(Duration.ofSeconds(10));
+            switch (method) {
+                case "PUT" -> b.PUT(publisher);
+                case "POST" -> b.POST(publisher);
+                default -> throw new IllegalArgumentException("unsupported method: " + method);
+            }
+            try {
+                HttpResponse<String> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() != 503) return resp;
+                // 503 from LeaderGuardFilter: registry cache caught a stale endpoint.
+                // Sleep briefly and let the watcher catch up before retrying.
+            } catch (ConnectException e) {
+                lastTransport = e;
+            }
+            Thread.sleep(LEADER_RESOLVE_BACKOFF_MS);
+        }
+        String msg = "exchange leader unreachable for " + method + " " + pathAndQuery
+                + " after " + attempts + " attempts";
+        if (lastTransport != null) throw new IllegalStateException(msg, lastTransport);
+        throw new IllegalStateException(msg);
     }
 
     @GetMapping("/health")

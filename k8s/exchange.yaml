@@ -22,13 +22,31 @@ spec:
   ports:
     - { name: http, port: 8080, targetPort: 8080, nodePort: 30181 }
 ---
+# Headless service: per-pod DNS exchange-N.exchange-hs used as Hazelcast
+# member identity and ha.advertise.host published in ZK.
+apiVersion: v1
+kind: Service
+metadata:
+  name: exchange-hs
+  namespace: market-maker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: exchange
+  ports:
+    - { name: http, port: 8080 }
+    - { name: hz,   port: 5701 }
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: exchange
   namespace: market-maker
 spec:
-  replicas: 1
+  serviceName: exchange-hs
+  replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: exchange
@@ -37,6 +55,40 @@ spec:
       labels:
         app: exchange
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: exchange
+                topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: wait-for-zk
+          image: rancher/mirrored-library-busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              for host in zk-0.zk-hs zk-1.zk-hs zk-2.zk-hs; do
+                until [ "$(echo ruok | nc -w 2 $host 2181 2>/dev/null)" = "imok" ]; do
+                  echo "waiting for $host:2181"
+                  sleep 2
+                done
+              done
+        - name: wait-for-postgres
+          image: rancher/mirrored-library-busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z -w 2 postgres 5432; do
+                echo "waiting for postgres:5432"
+                sleep 2
+              done
       containers:
         - name: app
           image: market-maker:1.0.0
@@ -45,8 +97,16 @@ spec:
             - { containerPort: 8080 }
             - { containerPort: 5701 }
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SPRING_PROFILES_ACTIVE
               value: exchange
+            - name: HA_ZOOKEEPER_CONNECT
+              value: "zk-0.zk-hs:2181,zk-1.zk-hs:2181,zk-2.zk-hs:2181"
+            - name: HA_ADVERTISE_HOST
+              value: "$(POD_NAME).exchange-hs.market-maker.svc.cluster.local"
             - name: HAZELCAST_MEMBERS
               valueFrom:
                 configMapKeyRef:

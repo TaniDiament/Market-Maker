@@ -49,6 +49,13 @@ services:
 
   postgres:
     image: postgres
+    # The compose stack runs ~17 JVMs (3x trading-state, 3x exchange,
+    # 3x exposure-reservation, 7x market-maker-node, plus publisher) and
+    # every one opens a HikariCP pool against this database. With Postgres'
+    # default max_connections=100 the late-starting market-maker-node JVMs
+    # crash on boot with "FATAL: sorry, too many clients already". Bump
+    # the limit so the full stack can converge.
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=password

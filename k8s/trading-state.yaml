@@ -24,13 +24,34 @@ spec:
   ports:
     - { name: http, port: 8080, targetPort: 8080, nodePort: 30180 }
 ---
+# Headless service: gives each replica stable per-pod DNS
+# (trading-state-0.trading-state-hs, ...). That hostname is used both as
+# the Hazelcast member identity and as ha.advertise.host published in ZK.
+# publishNotReadyAddresses lets peers find each other before any pod is Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-state-hs
+  namespace: market-maker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: trading-state
+  ports:
+    - { name: http,    port: 8080 }
+    - { name: rsocket, port: 7000 }
+    - { name: hz,      port: 5701 }
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: trading-state
   namespace: market-maker
 spec:
-  replicas: 1
+  serviceName: trading-state-hs
+  replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: trading-state
@@ -39,6 +60,40 @@ spec:
       labels:
         app: trading-state
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: trading-state
+                topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: wait-for-zk
+          image: rancher/mirrored-library-busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              for host in zk-0.zk-hs zk-1.zk-hs zk-2.zk-hs; do
+                until [ "$(echo ruok | nc -w 2 $host 2181 2>/dev/null)" = "imok" ]; do
+                  echo "waiting for $host:2181"
+                  sleep 2
+                done
+              done
+        - name: wait-for-postgres
+          image: rancher/mirrored-library-busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z -w 2 postgres 5432; do
+                echo "waiting for postgres:5432"
+                sleep 2
+              done
       containers:
         - name: app
           image: market-maker:1.0.0
@@ -48,8 +103,16 @@ spec:
             - { containerPort: 7000 }
             - { containerPort: 5701 }
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SPRING_PROFILES_ACTIVE
               value: trading-state
+            - name: HA_ZOOKEEPER_CONNECT
+              value: "zk-0.zk-hs:2181,zk-1.zk-hs:2181,zk-2.zk-hs:2181"
+            - name: HA_ADVERTISE_HOST
+              value: "$(POD_NAME).trading-state-hs.market-maker.svc.cluster.local"
             - name: HAZELCAST_MEMBERS
               valueFrom:
                 configMapKeyRef:

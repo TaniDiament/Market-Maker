@@ -124,6 +124,22 @@ public class ServiceRegistry implements DisposableBean {
                 }
             });
             cache.start();
+
+            // CuratorCache.start() returns before the initial sync from ZK
+            // completes, so the very first call to getLeaderAddress would see
+            // an empty map even when a leader has been published for a long
+            // time. Prime the cache synchronously here so first-call lookups
+            // are correct; the listener above keeps things current after that.
+            try {
+                byte[] data = curator.getData().forPath(path);
+                Endpoint ep = mapper.readValue(data, Endpoint.class);
+                leaders.put(s, ep);
+                log.info("[{}] primed leader endpoint from ZK -> {}", s, ep);
+            } catch (org.apache.zookeeper.KeeperException.NoNodeException e) {
+                // No leader yet — the listener will populate when one publishes.
+            } catch (Exception e) {
+                log.warn("[{}] failed to prime leader endpoint from ZK: {}", s, e.toString());
+            }
             return cache;
         });
     }

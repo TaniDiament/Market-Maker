@@ -1,11 +1,12 @@
 # Single source of truth for the Hazelcast TCP-IP member list.
-# All pods join one cluster; absent members are tolerated as in compose.
-# In-namespace short DNS names resolve via cluster DNS; mm-N.mm-hs entries
-# point at individual market-maker pods through the headless service.
+# All pods join one cluster; absent members are tolerated.
+# Per-pod stable DNS: <role>-N.<role>-hs for the StatefulSet replicas
+# (trading-state / exchange / exposure-reservation / mm); short DNS for
+# the singleton external-publisher service.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hazelcast-members
   namespace: market-maker
 data:
-  members: "trading-state,exchange,exposure-reservation,external-publisher,mm-0.mm-hs,mm-1.mm-hs,mm-2.mm-hs,mm-3.mm-hs,mm-4.mm-hs,mm-5.mm-hs,mm-6.mm-hs"
+  members: "trading-state-0.trading-state-hs,trading-state-1.trading-state-hs,trading-state-2.trading-state-hs,exchange-0.exchange-hs,exchange-1.exchange-hs,exchange-2.exchange-hs,exposure-reservation-0.exposure-reservation-hs,exposure-reservation-1.exposure-reservation-hs,exposure-reservation-2.exposure-reservation-hs,external-publisher,mm-0.mm-hs,mm-1.mm-hs,mm-2.mm-hs,mm-3.mm-hs,mm-4.mm-hs,mm-5.mm-hs,mm-6.mm-hs"
