@@ -28,6 +28,7 @@ import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.Collection;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import edu.yu.marketmaker.ha.LeaderElectionService;
@@ -285,8 +286,14 @@ public Flux<StateSnapshot> streamPositions() {
      * before live deltas start arriving on {@code /topic/positions}.
      */
     @SubscribeMapping("/positions.snapshot")
-    public Collection<Position> snapshot() {
-        return positionRepository.getAll();
+    public java.util.List<StateSnapshot> snapshot() {
+        return positionRepository.getAll().stream()
+                .map(p -> new StateSnapshot(
+                        p,
+                        p.lastFillId() != null
+                                ? fillRepository.get(p.lastFillId()).orElse(null)
+                                : null))
+                .toList();
     }
 
     /**
@@ -307,5 +314,14 @@ public Flux<StateSnapshot> streamPositions() {
             logger.debug("Quote proxy failed for {}: {}", symbol, e.getMessage());
             return ResponseEntity.notFound().build();
         }
+    }
+
+    /**
+     * HTTP: return the current leader's advertised hostname.
+     * Used by the UI and non-leader replicas to discover where to connect.
+     */
+    @GetMapping("/leader-info")
+    Map<String, String> getLeaderInfo(LeaderInfo leaderInfo) {
+        return Map.of("leaderHost", leaderInfo.getLeaderHost());
     }
 }

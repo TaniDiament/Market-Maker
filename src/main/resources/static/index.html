@@ -85,26 +85,15 @@
     } catch (e) { /* ignore */ }
   }
 
-  function applySnapshot(snap) {
+  function applySnapshot(snap, flash) {
     const sym = snap.position.symbol;
     state.set(sym, {
       position: snap.position,
       fill: snap.fill ?? state.get(sym)?.fill ?? null,
       quote: state.get(sym)?.quote ?? null,
     });
-    render(sym, true);
+    render(sym, flash);
     refreshQuote(sym);
-  }
-
-  function applyInitialPosition(pos) {
-    const existing = state.get(pos.symbol);
-    state.set(pos.symbol, {
-      position: pos,
-      fill: existing?.fill ?? null,
-      quote: existing?.quote ?? null,
-    });
-    render(pos.symbol, false);
-    refreshQuote(pos.symbol);
   }
 
   const client = new StompJs.Client({
@@ -113,11 +102,11 @@
     onConnect: () => {
       setStatus('connected to leader', true);
       client.subscribe('/app/positions.snapshot', m => {
-        const positions = JSON.parse(m.body);
-        positions.forEach(applyInitialPosition);
+        const snapshots = JSON.parse(m.body);
+        snapshots.forEach(s => applySnapshot(s, false));
       });
       client.subscribe('/topic/positions', m => {
-        applySnapshot(JSON.parse(m.body));
+        applySnapshot(JSON.parse(m.body), true);
       });
     },
     onWebSocketClose: () => setStatus('disconnected — retrying', false),
