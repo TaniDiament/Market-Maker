@@ -65,8 +65,17 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
     private static final Set<String> SEED_SYMBOLS = new TreeSet<>(List.of(
             "AAPL", "MSFT", "GOOG", "TSLA", "NVDA", "AMZN", "META"));
 
-    /** Symbol whose owner MM we crash mid-replace. */
-    private static final String TARGET_SYMBOL = "AAPL";
+    // The crash target is the pod that StatefulSet scale-down removes first
+    // (highest ordinal). We then scale `sts/mm` to TARGET_REPLICAS so kubelet
+    // won't recreate it — that's the closest k3s analogue to the local
+    // docker-compose scenario where the dead container stays dead. The symbol
+    // we crash mid-replace is whichever one this pod currently owns; it's
+    // resolved from /marketmaker/status at runtime instead of being hardcoded
+    // because symbol→pod assignment depends on the cluster's hash sharding.
+    private static final String TARGET_POD = "mm-6";
+    private static final int TARGET_PORT = 30087;
+    private static final int TARGET_REPLICAS = 6;
+    private static final int FULL_REPLICAS = 7;
 
     private static final int WARMUP_WAVES = 4;
     private static final long WAVE_INTERVAL_MS = 1500;
@@ -82,6 +91,16 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
     private static final String HOST = System.getProperty("cluster.k8s.host", "localhost");
     private static final String NS   = System.getProperty("cluster.k8s.namespace", "market-maker");
     private static final String KUBECTL = System.getProperty("kubectl", "kubectl");
+
+    // SSH the kubectl invocations to the control-plane node where KUBECONFIG
+    // is actually configured. Without this, running the test from a dev box
+    // produces silent "Error from server (NotFound)" failures because kubectl
+    // is talking to the wrong API server. Set -Dkubectl.ssh="" to disable
+    // (i.e. when running the test on cp1 itself).
+    private static final String KUBECTL_SSH = System.getProperty("kubectl.ssh",
+            "ssh sack@192.168.8.11");
+    private static final String KUBECTL_REMOTE = System.getProperty("kubectl.remote",
+            "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl");
 
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
@@ -143,26 +162,33 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             Thread.sleep(WAVE_INTERVAL_MS);
         }
 
+        // 2. Pick the crash target dynamically: whichever symbol the
+        //    highest-ordinal pod (TARGET_POD) currently owns. We crash that
+        //    pod and then `kubectl scale sts/mm --replicas=TARGET_REPLICAS`,
+        //    which removes the highest-ordinal pod and prevents kubelet from
+        //    recreating it — the closest k3s analogue to local docker-compose
+        //    leaving the dead container down.
+        diagnosticTarget = TARGET_POD;
+        String targetSymbol = firstSymbolOwnedBy(TARGET_PORT);
+        assertNotNull(targetSymbol,
+                TARGET_POD + " owns no symbols after warmup; cannot pick a crash target. "
+                        + "Either symbols < pods or rebalancing is still in progress.");
+        System.out.println("[ERR10-k8s] crash target: " + TARGET_POD + " owns " + targetSymbol);
+
         // Wait for the MM-published quote to land in the exchange for the
         // target symbol. Without this, the orphan-window assertion below
         // might catch a bootstrap quote that the MM never owned.
+        final String symbol = targetSymbol;
         awaitCondition(Duration.ofSeconds(30), () -> {
-            Quote q = currentExchangeQuote(TARGET_SYMBOL);
+            Quote q = currentExchangeQuote(symbol);
             return q != null && !bootstrapQuoteIds.contains(q.quoteId());
-        }, "no MM-generated quote for " + TARGET_SYMBOL + " after " + WARMUP_WAVES + " waves");
+        }, "no MM-generated quote for " + targetSymbol + " after " + WARMUP_WAVES + " waves");
 
-        Quote preCrashQuote = currentExchangeQuote(TARGET_SYMBOL);
-        assertNotNull(preCrashQuote, "pre-crash exchange must hold a quote for " + TARGET_SYMBOL);
+        Quote preCrashQuote = currentExchangeQuote(targetSymbol);
+        assertNotNull(preCrashQuote, "pre-crash exchange must hold a quote for " + targetSymbol);
         assertNotEquals(true, bootstrapQuoteIds.contains(preCrashQuote.quoteId()),
                 "pre-crash quote must be MM-generated, not bootstrap: " + preCrashQuote);
         System.out.println("[ERR10-k8s] pre-crash quote: " + preCrashQuote);
-
-        // 3. Find which MM owns the target symbol via /marketmaker/status.
-        int ownerPort = findOwnerPort(TARGET_SYMBOL);
-        String ownerPod = MM_PORT_TO_POD.get(ownerPort);
-        assertNotNull(ownerPod, "no MM owner pod found for " + TARGET_SYMBOL);
-        diagnosticTarget = ownerPod;
-        System.out.println("[ERR10-k8s] " + TARGET_SYMBOL + " owner: " + ownerPod + " on port " + ownerPort);
 
         // 4. Snapshot the global exposure state. Post-crash the release call
         //    fired by the FaultInjector must drop the active reservation
@@ -175,56 +201,67 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         assertTrue(preCrashActive >= 1,
                 "pre-crash there must be at least one active reservation; got " + preCrashActive);
 
-        // 5. Arm the fault injector on the owner MM. The next time that MM
-        //    processes a replace cycle for TARGET_SYMBOL it will release the
-        //    reservation and halt.
-        armFaultInjector(ownerPort, TARGET_SYMBOL);
-        System.out.println("[ERR10-k8s] armed " + ownerPod + " to crash on next replace of " + TARGET_SYMBOL);
+        // 5. Arm the fault injector on TARGET_POD. The next time it processes
+        //    a replace cycle for targetSymbol it will release the reservation
+        //    and halt.
+        armFaultInjector(TARGET_PORT, targetSymbol);
+        System.out.println("[ERR10-k8s] armed " + TARGET_POD + " to crash on next replace of " + targetSymbol);
 
-        // 6. Drive wide orders on the target symbol until the owner MM dies
-        //    (or the timeout elapses). A single order isn't reliable: it may
-        //    not cross, the quote may expire and be replaced between
-        //    observation and submission, or the exchange may reject it
-        //    transiently. Sustained pressure guarantees at least one fill
-        //    once the MM republishes a fresh quote, which produces a
-        //    position update → replace cycle → hook fires.
+        // 6. Drive wide orders on the target symbol until TARGET_POD dies (or
+        //    the timeout elapses). A single order isn't reliable: it may not
+        //    cross, the quote may expire and be replaced between observation
+        //    and submission, or the exchange may reject it transiently.
+        //    Sustained pressure guarantees at least one fill once the MM
+        //    republishes a fresh quote, which produces a position update →
+        //    replace cycle → hook fires.
         long crashTriggerMillis = System.currentTimeMillis();
-        boolean crashed = driveOrdersUntilCrash(ownerPort, ownerPod, TARGET_SYMBOL,
+        boolean crashed = driveOrdersUntilCrash(TARGET_PORT, TARGET_POD, targetSymbol,
                 Duration.ofSeconds(60));
         if (!crashed) {
             // Dump diagnostic info into the test output BEFORE failing,
             // so the user can see the FAULT-INJECTION log lines without
             // having to kubectl into a pod that may have already restarted.
-            dumpMmDiagnostics(ownerPod);
-            fail("owner pod " + ownerPod
+            dumpMmDiagnostics(TARGET_POD);
+            fail("owner pod " + TARGET_POD
                     + " did not appear unhealthy within 60s of arm — fault injector may not have fired. "
                     + "Check that the fault-injection profile is active on the MM (k8s/market-maker.yaml) "
-                    + "and that position updates for " + TARGET_SYMBOL + " are reaching this pod.");
+                    + "and that position updates for " + targetSymbol + " are reaching this pod.");
         }
         long crashObservedMillis = System.currentTimeMillis();
-        System.out.println("[ERR10-k8s] " + ownerPod + " confirmed unhealthy (~" +
+        System.out.println("[ERR10-k8s] " + TARGET_POD + " confirmed unhealthy (~" +
                 (crashObservedMillis - crashTriggerMillis) + "ms after first trigger)");
 
+        // 7. Scale `sts/mm` to TARGET_REPLICAS so kubelet won't restart the
+        //    crashed pod. StatefulSet scale-down always removes the highest
+        //    ordinal first, which is exactly TARGET_POD. Without this, the
+        //    cluster would briefly drop to N-1 members then return to N as
+        //    the pod restarts, never reaching the "permanent loss" state
+        //    we're testing recovery against. @AfterAll restores the replica
+        //    count.
+        System.out.println("[ERR10-k8s] scaling sts/mm to " + TARGET_REPLICAS
+                + " so kubelet won't recreate " + TARGET_POD + "...");
+        scaleMmStatefulSet(TARGET_REPLICAS);
+
         // 8. Post-crash exposure snapshot. We do NOT assert on a drop in
-        //    activeReservations: when the FaultInjector frees AAPL's
+        //    activeReservations: when the FaultInjector frees the symbol's
         //    capacity, other MMs whose quote-replace cycles had been
-        //    receiving PARTIAL/DENIED grants (or HA-failover for the
-        //    target symbol itself) immediately take the freed slot. The
-        //    activeReservations counter rarely shows a transient drop at
-        //    our 250ms polling granularity. The release-before-crash half
-        //    of error case 10 is proven by the FaultInjector log line
-        //    "[FAULT-INJECTION] release returned freed=… for symbol=AAPL"
-        //    in the MM pod logs (visible via dumpMmDiagnostics on
-        //    failure); the bad state we assert below is the *externally
-        //    visible* one — the exchange still holds the orphan quote
-        //    even though no MM has a backing reservation for it.
+        //    receiving PARTIAL/DENIED grants (or HA-failover for the target
+        //    symbol itself) immediately take the freed slot. The
+        //    activeReservations counter rarely shows a transient drop at our
+        //    250ms polling granularity. The release-before-crash half of
+        //    error case 10 is proven by the FaultInjector log line
+        //    "[FAULT-INJECTION] release returned freed=… for symbol=…" in
+        //    the MM pod logs (visible via dumpMmDiagnostics on failure); the
+        //    bad state we assert below is the *externally visible* one — the
+        //    exchange still holds the orphan quote even though no MM has a
+        //    backing reservation for it.
         ExposureState postCrashExposure = currentExposure();
         System.out.println("[ERR10-k8s] post-crash exposure (informational only, not asserted): "
                 + postCrashExposure);
 
-        Quote orphanQuote = currentExchangeQuote(TARGET_SYMBOL);
+        Quote orphanQuote = currentExchangeQuote(targetSymbol);
         assertNotNull(orphanQuote,
-                "exchange must still hold *some* quote for " + TARGET_SYMBOL
+                "exchange must still hold *some* quote for " + targetSymbol
                         + " immediately after crash (either the orphan or a fresh "
                         + "post-HA-failover replacement)");
         boolean orphanObserved = preCrashQuote.quoteId().equals(orphanQuote.quoteId());
@@ -262,10 +299,10 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             //       against it (FillOrderDispatcher.java:55).
             //   (b) HA failover finally kicked in and the orphan was
             //       replaced sometime during our wait — the bound held.
-            Quote postTtlQuote = currentExchangeQuote(TARGET_SYMBOL);
+            Quote postTtlQuote = currentExchangeQuote(targetSymbol);
             if (postTtlQuote != null && orphanQuote.quoteId().equals(postTtlQuote.quoteId())) {
                 System.out.println("[ERR10-k8s] orphan still resident in exchange — verifying rejection");
-                assertExpiredQuoteRejectsOrders(TARGET_SYMBOL, orphanQuote.quoteId());
+                assertExpiredQuoteRejectsOrders(targetSymbol, orphanQuote.quoteId());
             } else {
                 System.out.println("[ERR10-k8s] orphan replaced via HA failover during TTL wait: "
                         + postTtlQuote);
@@ -274,29 +311,27 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             System.out.println("[ERR10-k8s] skipping TTL/rejection checks — orphan never observed (HA failover beat us to it)");
         }
 
-        // 10. Recovery via HA failover: we deliberately do not wait for
-        //     kubelet to restart the crashed pod. The cluster must detect
-        //     the failure, evict the dead node, and reassign TARGET_SYMBOL
-        //     to a surviving MM on its own.
-        final int crashedPort = ownerPort;
-        int expectedMembers = MM_PORT_TO_POD.size() - 1;
-        System.out.println("[ERR10-k8s] waiting for cluster to evict " + ownerPod
-                + " and converge to " + expectedMembers + " members...");
+        // 10. Recovery via HA failover: TARGET_POD is permanently gone
+        //     (scale-down at step 7). The cluster must detect the failure,
+        //     evict the dead node, and reassign targetSymbol to a surviving
+        //     MM on its own.
+        System.out.println("[ERR10-k8s] waiting for cluster to evict " + TARGET_POD
+                + " and converge to " + TARGET_REPLICAS + " members...");
         awaitCondition(Duration.ofMinutes(4),
-                () -> clusterConvergedExcluding(crashedPort),
-                "cluster did not evict " + ownerPod + " and reconverge within 4 minutes");
+                () -> clusterConvergedExcluding(TARGET_PORT),
+                "cluster did not evict " + TARGET_POD + " and reconverge within 4 minutes");
 
-        // 11. Wait for some surviving MM to take ownership of TARGET_SYMBOL.
-        System.out.println("[ERR10-k8s] waiting for HA reassignment of " + TARGET_SYMBOL + "...");
+        // 11. Wait for some surviving MM to take ownership of targetSymbol.
+        System.out.println("[ERR10-k8s] waiting for HA reassignment of " + targetSymbol + "...");
         awaitCondition(Duration.ofMinutes(2),
-                () -> ownerPortOrMinusOne(TARGET_SYMBOL, crashedPort) != -1,
-                TARGET_SYMBOL + " was not reassigned to a different MM within 2 minutes");
-        int newOwnerPort = ownerPortOrMinusOne(TARGET_SYMBOL, crashedPort);
+                () -> ownerPortOrMinusOne(symbol, TARGET_PORT) != -1,
+                targetSymbol + " was not reassigned to a different MM within 2 minutes");
+        int newOwnerPort = ownerPortOrMinusOne(targetSymbol, TARGET_PORT);
         String newOwnerPod = MM_PORT_TO_POD.get(newOwnerPort);
-        System.out.println("[ERR10-k8s] " + TARGET_SYMBOL + " reassigned to " + newOwnerPod
+        System.out.println("[ERR10-k8s] " + targetSymbol + " reassigned to " + newOwnerPod
                 + " on port " + newOwnerPort);
 
-        // 12. ASSERT — recovery: the new owner of TARGET_SYMBOL must publish
+        // 12. ASSERT — recovery: the new owner of targetSymbol must publish
         //     a fresh MM quote on its own. AssignmentListener bootstraps a
         //     quote for newly-assigned symbols by fetching the current
         //     position from trading-state, so the new owner doesn't need a
@@ -304,16 +339,52 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         //     because the orphan in the exchange is expired and would
         //     reject any order before a new quote replaces it.
         awaitCondition(Duration.ofSeconds(30), () -> {
-            Quote q = currentExchangeQuote(TARGET_SYMBOL);
+            Quote q = currentExchangeQuote(symbol);
             return q != null
                     && !preCrashQuote.quoteId().equals(q.quoteId())
                     && q.expiresAt() > System.currentTimeMillis();
-        }, "after HA failover, the new owner of " + TARGET_SYMBOL
+        }, "after HA failover, the new owner of " + targetSymbol
                 + " did not publish a fresh MM quote within 30s — cluster did not self-recover");
 
-        Quote recoveryQuote = currentExchangeQuote(TARGET_SYMBOL);
+        Quote recoveryQuote = currentExchangeQuote(targetSymbol);
         System.out.println("[ERR10-k8s] recovery quote: " + recoveryQuote);
         System.out.println("[ERR10-k8s] post-recovery exposure (informational): " + currentExposure());
+    }
+
+    /**
+     * Return the first symbol currently assigned to the MM listening on
+     * {@code port}, or null if none. Used to dynamically pick a crash target
+     * after warmup so the test doesn't depend on a hash-based assumption
+     * about which pod owns AAPL.
+     */
+    private static String firstSymbolOwnedBy(int port) throws Exception {
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create("http://" + HOST + ":" + port + "/marketmaker/status"))
+                .timeout(Duration.ofSeconds(5))
+                .GET().build();
+        HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) return null;
+        JsonNode body = JSON.readTree(resp.body());
+        JsonNode assigned = body.path("assigned");
+        if (!assigned.isArray() || assigned.isEmpty()) return null;
+        return assigned.get(0).asText();
+    }
+
+    private static void scaleMmStatefulSet(int replicas) throws Exception {
+        String out = runKubectlCapturing(TimeUnit.SECONDS.toMillis(30),
+                "scale", "sts/mm", "-n", NS, "--replicas=" + replicas);
+        System.out.println("[ERR10-k8s] kubectl scale sts/mm --replicas=" + replicas + ": "
+                + out.trim());
+    }
+
+    @org.junit.jupiter.api.AfterAll
+    static void restoreReplicaCount() {
+        try {
+            System.out.println("[ERR10-k8s] @AfterAll: restoring sts/mm to " + FULL_REPLICAS + " replicas");
+            scaleMmStatefulSet(FULL_REPLICAS);
+        } catch (Exception e) {
+            System.err.println("[ERR10-k8s] failed to restore sts/mm replica count: " + e);
+        }
     }
 
     // ---------- per-test helpers ----------
@@ -607,9 +678,21 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
     }
 
     private static String runKubectlCapturing(long timeoutMs, String... args) throws Exception {
+        // When kubectl.ssh is set (default), shell out to ssh and run the
+        // kubectl invocation on the control-plane node where KUBECONFIG is
+        // configured. Otherwise (kubectl.ssh="") run the local kubectl.
         List<String> cmd = new ArrayList<>();
-        cmd.add(KUBECTL);
-        Collections.addAll(cmd, args);
+        if (KUBECTL_SSH != null && !KUBECTL_SSH.isBlank()) {
+            // Build a single shell-string argument so quoting on the remote
+            // side matches what the install docs use.
+            StringBuilder remote = new StringBuilder(KUBECTL_REMOTE);
+            for (String a : args) remote.append(' ').append(a);
+            for (String token : KUBECTL_SSH.split(" +")) cmd.add(token);
+            cmd.add(remote.toString());
+        } else {
+            cmd.add(KUBECTL);
+            Collections.addAll(cmd, args);
+        }
         ProcessBuilder pb = new ProcessBuilder(cmd).redirectErrorStream(true);
         Process p = pb.start();
         StringBuilder output = new StringBuilder();
