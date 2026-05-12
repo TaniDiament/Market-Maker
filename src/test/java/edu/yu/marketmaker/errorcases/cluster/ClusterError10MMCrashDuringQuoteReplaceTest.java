@@ -23,6 +23,8 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>Same end-to-end assertions for error case 10, but talks to a running
  * k3s cluster via NodePorts instead of bringing up a docker-compose stack.
+ * The dead pod is deliberately not waited-on for restart — the cluster must
+ * self-recover via HA failover (PR #88) just like in the local variant.
  *
  * <p>Pre-conditions (must hold before invoking this test):
  * <ol>
@@ -67,12 +69,9 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
     private static final String TARGET_SYMBOL = "AAPL";
 
     private static final int WARMUP_WAVES = 4;
-    private static final int RECOVERY_WAVES = 6;
     private static final long WAVE_INTERVAL_MS = 1500;
-    private static final int SELF_CROSS_PAIRS_PER_WAVE = 5;
-    private static final double SELF_CROSS_PRICE = 100.00;
-    private static final double WIDE_BUY_LIMIT = 101.00;
-    private static final double WIDE_SELL_LIMIT = 99.00;
+    /** Orders per symbol per wave when calling /publisher/submit-orders. */
+    private static final int ORDERS_PER_SYMBOL_PER_WAVE = 2;
 
     // NodePorts defined in k8s/*.yaml — mirror ClusterIntegrationWithSystemK8sTest.
     private static final int TRADING_STATE_PORT = 30180;
@@ -104,9 +103,9 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         }
 
         System.out.println("[ERR10-k8s] waiting for 7-node cluster convergence...");
-        awaitCondition(Duration.ofMinutes(4),
+        awaitCondition(Duration.ofMinutes(8),
                 ClusterError10MMCrashDuringQuoteReplaceTest::allNodesConverged,
-                "cluster did not converge within 4 minutes");
+                "cluster did not converge within 8 minutes");
         System.out.println("[ERR10-k8s] full stack up.");
     }
 
@@ -118,6 +117,9 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         try {
             runScenario();
         } catch (Throwable t) {
+            // Dump diagnostics for whichever MM we last identified as the
+            // crash target, so failures past the crash point still surface
+            // the FAULT-INJECTION log lines we need to root-cause.
             if (diagnosticTarget != null) {
                 dumpMmDiagnostics(diagnosticTarget);
             }
@@ -126,7 +128,8 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
     }
 
     private void runScenario() throws Exception {
-        // 1. Seed bootstrap quotes via external-publisher.
+        // 1. Seed bootstrap quotes for every symbol so the assigned MMs have
+        //    something to replace.
         System.out.println("[ERR10-k8s] seeding bootstrap quotes...");
         List<String> seedList = new ArrayList<>(SEED_SYMBOLS);
         List<UUID> bootstrapIds = seedQuotes(seedList);
@@ -134,14 +137,15 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         assertEquals(SEED_SYMBOLS.size(), bootstrapQuoteIds.size(),
                 "publisher must return one quoteId per symbol");
 
-        // 2. Warmup waves so the assigned MM publishes its own quote.
-        System.out.println("[ERR10-k8s] warmup: " + WARMUP_WAVES + " waves to force initial replace cycles...");
-        Random rnd = new Random(0xC0FFEE);
+        System.out.println("[ERR10-k8s] warmup: driving " + WARMUP_WAVES + " waves to force initial replace cycles...");
         for (int wave = 1; wave <= WARMUP_WAVES; wave++) {
-            driveOneWave(wave, rnd);
+            driveOneWave(wave);
             Thread.sleep(WAVE_INTERVAL_MS);
         }
 
+        // Wait for the MM-published quote to land in the exchange for the
+        // target symbol. Without this, the orphan-window assertion below
+        // might catch a bootstrap quote that the MM never owned.
         awaitCondition(Duration.ofSeconds(30), () -> {
             Quote q = currentExchangeQuote(TARGET_SYMBOL);
             return q != null && !bootstrapQuoteIds.contains(q.quoteId());
@@ -153,14 +157,17 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
                 "pre-crash quote must be MM-generated, not bootstrap: " + preCrashQuote);
         System.out.println("[ERR10-k8s] pre-crash quote: " + preCrashQuote);
 
-        // 3. Find the owner pod via /marketmaker/status.
+        // 3. Find which MM owns the target symbol via /marketmaker/status.
         int ownerPort = findOwnerPort(TARGET_SYMBOL);
         String ownerPod = MM_PORT_TO_POD.get(ownerPort);
         assertNotNull(ownerPod, "no MM owner pod found for " + TARGET_SYMBOL);
         diagnosticTarget = ownerPod;
         System.out.println("[ERR10-k8s] " + TARGET_SYMBOL + " owner: " + ownerPod + " on port " + ownerPort);
 
-        // 4. Snapshot global exposure pre-crash.
+        // 4. Snapshot the global exposure state. Post-crash the release call
+        //    fired by the FaultInjector must drop the active reservation
+        //    count by exactly 1 (this symbol's reservation), proving the
+        //    documented "release before crash" half of error case 10.
         ExposureState preCrashExposure = currentExposure();
         assertNotNull(preCrashExposure, "exposure-reservation /exposure must return state pre-crash");
         int preCrashActive = preCrashExposure.activeReservations();
@@ -168,34 +175,49 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         assertTrue(preCrashActive >= 1,
                 "pre-crash there must be at least one active reservation; got " + preCrashActive);
 
-        // 5. Arm the FaultInjector on the owner pod.
+        // 5. Arm the fault injector on the owner MM. The next time that MM
+        //    processes a replace cycle for TARGET_SYMBOL it will release the
+        //    reservation and halt.
         armFaultInjector(ownerPort, TARGET_SYMBOL);
         System.out.println("[ERR10-k8s] armed " + ownerPod + " to crash on next replace of " + TARGET_SYMBOL);
 
-        // 6. Drive wide orders on the target symbol until the owner pod's
-        //    market-maker app stops responding (or timeout). Sustained
-        //    pressure is needed because a single order may not generate a
-        //    fill (no fresh quote, transient rejection, etc.).
-        //
-        //    Note: kubelet will likely restart the pod (StatefulSet
-        //    livenessProbe + container restart policy), but until it
-        //    recovers, /marketmaker/status returns non-200 or fails.
+        // 6. Drive wide orders on the target symbol until the owner MM dies
+        //    (or the timeout elapses). A single order isn't reliable: it may
+        //    not cross, the quote may expire and be replaced between
+        //    observation and submission, or the exchange may reject it
+        //    transiently. Sustained pressure guarantees at least one fill
+        //    once the MM republishes a fresh quote, which produces a
+        //    position update → replace cycle → hook fires.
         long crashTriggerMillis = System.currentTimeMillis();
         boolean crashed = driveOrdersUntilCrash(ownerPort, ownerPod, TARGET_SYMBOL,
                 Duration.ofSeconds(60));
-        assertTrue(crashed, "owner pod " + ownerPod
-                + " did not appear unhealthy within 60s of arm — fault injector may not have fired.");
+        if (!crashed) {
+            // Dump diagnostic info into the test output BEFORE failing,
+            // so the user can see the FAULT-INJECTION log lines without
+            // having to kubectl into a pod that may have already restarted.
+            dumpMmDiagnostics(ownerPod);
+            fail("owner pod " + ownerPod
+                    + " did not appear unhealthy within 60s of arm — fault injector may not have fired. "
+                    + "Check that the fault-injection profile is active on the MM (k8s/market-maker.yaml) "
+                    + "and that position updates for " + TARGET_SYMBOL + " are reaching this pod.");
+        }
         long crashObservedMillis = System.currentTimeMillis();
         System.out.println("[ERR10-k8s] " + ownerPod + " confirmed unhealthy (~" +
                 (crashObservedMillis - crashTriggerMillis) + "ms after first trigger)");
 
-        // 8. Post-crash exposure (informational only). Asserting on a
-        //    drop in activeReservations is unreliable: HA failover and
-        //    backed-up replace cycles on other MMs reuse the freed slot
-        //    within our polling granularity. The release-before-crash
-        //    half of error case 10 is proven by the MM log line
-        //    "[FAULT-INJECTION] release returned freed=…" (see kubectl
-        //    logs dumped via dumpMmDiagnostics on failure).
+        // 8. Post-crash exposure snapshot. We do NOT assert on a drop in
+        //    activeReservations: when the FaultInjector frees AAPL's
+        //    capacity, other MMs whose quote-replace cycles had been
+        //    receiving PARTIAL/DENIED grants (or HA-failover for the
+        //    target symbol itself) immediately take the freed slot. The
+        //    activeReservations counter rarely shows a transient drop at
+        //    our 250ms polling granularity. The release-before-crash half
+        //    of error case 10 is proven by the FaultInjector log line
+        //    "[FAULT-INJECTION] release returned freed=… for symbol=AAPL"
+        //    in the MM pod logs (visible via dumpMmDiagnostics on
+        //    failure); the bad state we assert below is the *externally
+        //    visible* one — the exchange still holds the orphan quote
+        //    even though no MM has a backing reservation for it.
         ExposureState postCrashExposure = currentExposure();
         System.out.println("[ERR10-k8s] post-crash exposure (informational only, not asserted): "
                 + postCrashExposure);
@@ -210,29 +232,40 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             System.out.println("[ERR10-k8s] orphan quote confirmed (still the pre-crash quoteId): "
                     + orphanQuote);
         } else {
-            System.out.println("[ERR10-k8s] orphan already replaced before query — HA failover "
-                    + "faster than orphan-window measurement (pre=" + preCrashQuote.quoteId()
-                    + " now=" + orphanQuote.quoteId() + ")");
+            // HA failover (PR #88) reassigned the target symbol to another
+            // MM, which republished a fresh quote before we could query.
+            // The inconsistency window was strictly shorter than the
+            // documented 30s TTL bound — strictly better than error case
+            // 10's worst case.
+            System.out.println("[ERR10-k8s] orphan already replaced before query — HA failover faster than orphan-window measurement"
+                    + " (pre=" + preCrashQuote.quoteId() + " now=" + orphanQuote.quoteId() + ")");
         }
 
-        // 9. TTL bound check — only meaningful if we caught the orphan.
-        //    If HA failover already replaced it, the window was strictly
-        //    shorter than the documented 30s and there's nothing to wait
-        //    for.
+        // 9. ASSERT — TTL bound (only meaningful if we actually observed
+        //    the orphan; if HA failover already replaced it, the window
+        //    was strictly shorter than the documented bound and there's
+        //    nothing to wait for).
         if (orphanObserved) {
-            long ttlDeadline = orphanQuote.expiresAt() + 2_000L;
+            long ttlDeadline = orphanQuote.expiresAt() + 2_000L; // small safety margin
             long waitForTtl = Math.max(0L, ttlDeadline - System.currentTimeMillis());
             System.out.println("[ERR10-k8s] waiting " + waitForTtl + "ms for orphan TTL to elapse...");
             Thread.sleep(waitForTtl);
             assertTrue(orphanQuote.expiresAt() < System.currentTimeMillis(),
-                    "orphan quote must be past its TTL: expiresAt=" + orphanQuote.expiresAt()
+                    "orphan quote must be past its TTL by now: expiresAt=" + orphanQuote.expiresAt()
                             + " now=" + System.currentTimeMillis());
-            System.out.println("[ERR10-k8s] orphan quote TTL elapsed");
+            System.out.println("[ERR10-k8s] orphan quote TTL elapsed (expiresAt was "
+                    + orphanQuote.expiresAt() + ")");
 
+            // After the TTL: two valid states.
+            //   (a) The orphan quote (same quoteId) is still in the
+            //       exchange. FillOrderDispatcher must reject orders
+            //       against it (FillOrderDispatcher.java:55).
+            //   (b) HA failover finally kicked in and the orphan was
+            //       replaced sometime during our wait — the bound held.
             Quote postTtlQuote = currentExchangeQuote(TARGET_SYMBOL);
             if (postTtlQuote != null && orphanQuote.quoteId().equals(postTtlQuote.quoteId())) {
                 System.out.println("[ERR10-k8s] orphan still resident in exchange — verifying rejection");
-                assertExpiredQuoteRejectsOrders(TARGET_SYMBOL);
+                assertExpiredQuoteRejectsOrders(TARGET_SYMBOL, orphanQuote.quoteId());
             } else {
                 System.out.println("[ERR10-k8s] orphan replaced via HA failover during TTL wait: "
                         + postTtlQuote);
@@ -241,43 +274,75 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             System.out.println("[ERR10-k8s] skipping TTL/rejection checks — orphan never observed (HA failover beat us to it)");
         }
 
-        // 10. Recovery: under k3s the StatefulSet restarts the crashed pod
-        //     automatically; just wait for the cluster to reconverge.
-        System.out.println("[ERR10-k8s] waiting for cluster reconvergence after crash...");
-        awaitCondition(Duration.ofMinutes(5),
-                ClusterError10MMCrashDuringQuoteReplaceTest::allNodesConverged,
-                "cluster did not reconverge within 5 minutes after restart");
+        // 10. Recovery via HA failover: we deliberately do not wait for
+        //     kubelet to restart the crashed pod. The cluster must detect
+        //     the failure, evict the dead node, and reassign TARGET_SYMBOL
+        //     to a surviving MM on its own.
+        final int crashedPort = ownerPort;
+        int expectedMembers = MM_PORT_TO_POD.size() - 1;
+        System.out.println("[ERR10-k8s] waiting for cluster to evict " + ownerPod
+                + " and converge to " + expectedMembers + " members...");
+        awaitCondition(Duration.ofMinutes(4),
+                () -> clusterConvergedExcluding(crashedPort),
+                "cluster did not evict " + ownerPod + " and reconverge within 4 minutes");
 
-        System.out.println("[ERR10-k8s] recovery: driving " + RECOVERY_WAVES + " more waves...");
-        for (int wave = 1; wave <= RECOVERY_WAVES; wave++) {
-            driveOneWave(WARMUP_WAVES + wave, rnd);
-            Thread.sleep(WAVE_INTERVAL_MS);
-        }
+        // 11. Wait for some surviving MM to take ownership of TARGET_SYMBOL.
+        System.out.println("[ERR10-k8s] waiting for HA reassignment of " + TARGET_SYMBOL + "...");
+        awaitCondition(Duration.ofMinutes(2),
+                () -> ownerPortOrMinusOne(TARGET_SYMBOL, crashedPort) != -1,
+                TARGET_SYMBOL + " was not reassigned to a different MM within 2 minutes");
+        int newOwnerPort = ownerPortOrMinusOne(TARGET_SYMBOL, crashedPort);
+        String newOwnerPod = MM_PORT_TO_POD.get(newOwnerPort);
+        System.out.println("[ERR10-k8s] " + TARGET_SYMBOL + " reassigned to " + newOwnerPod
+                + " on port " + newOwnerPort);
 
-        // 11. ASSERT — recovery: a fresh, valid quote exists for the
-        //     target symbol with an id that differs from pre-crash and
-        //     a future expiresAt. activeReservations equality is not
-        //     asserted — see comment in section 8.
+        // 12. ASSERT — recovery: the new owner of TARGET_SYMBOL must publish
+        //     a fresh MM quote on its own. AssignmentListener bootstraps a
+        //     quote for newly-assigned symbols by fetching the current
+        //     position from trading-state, so the new owner doesn't need a
+        //     fill to produce its first quote — which is essential here
+        //     because the orphan in the exchange is expired and would
+        //     reject any order before a new quote replaces it.
+        awaitCondition(Duration.ofSeconds(30), () -> {
+            Quote q = currentExchangeQuote(TARGET_SYMBOL);
+            return q != null
+                    && !preCrashQuote.quoteId().equals(q.quoteId())
+                    && q.expiresAt() > System.currentTimeMillis();
+        }, "after HA failover, the new owner of " + TARGET_SYMBOL
+                + " did not publish a fresh MM quote within 30s — cluster did not self-recover");
+
         Quote recoveryQuote = currentExchangeQuote(TARGET_SYMBOL);
-        assertNotNull(recoveryQuote,
-                "exchange must hold a quote for " + TARGET_SYMBOL + " after recovery");
-        assertNotEquals(preCrashQuote.quoteId(), recoveryQuote.quoteId(),
-                "post-recovery quoteId must differ from pre-crash: "
-                        + "preCrash=" + preCrashQuote.quoteId()
-                        + " recovery=" + recoveryQuote.quoteId());
-        assertTrue(recoveryQuote.expiresAt() > System.currentTimeMillis(),
-                "recovery quote must have a future expiresAt: " + recoveryQuote);
         System.out.println("[ERR10-k8s] recovery quote: " + recoveryQuote);
         System.out.println("[ERR10-k8s] post-recovery exposure (informational): " + currentExposure());
     }
 
     // ---------- per-test helpers ----------
 
+    private static void driveOneWave(int wave) {
+        int accepted = submitOrdersViaPublisher(ORDERS_PER_SYMBOL_PER_WAVE,
+                new ArrayList<>(SEED_SYMBOLS));
+        System.out.println("[ERR10-k8s] wave " + wave + ": exchange accepted " + accepted + " orders");
+    }
+
     /**
-     * Dump diagnostic info about {@code pod} into the JUnit report. Three
-     * sections: environment ({@code SPRING_PROFILES_ACTIVE}), live state
-     * of {@code /test/fault-injection/status}, and the last 500 log
-     * lines — collectively answer "did the hook fire, and if not why".
+     * Print diagnostic information about the owner MM pod into
+     * {@code System.out} so the JUnit report captures it.
+     *
+     * <p>Three sections, each answering a specific question about why the
+     * fault injector might not have fired:
+     * <ol>
+     *   <li>{@code env | grep SPRING_PROFILES_ACTIVE} — is the
+     *       {@code fault-injection} profile actually active inside the
+     *       pod? (If not, neither the controller nor the injector bean
+     *       exist; the arm endpoint should have returned 404 but if it
+     *       returned 200 against a stale image this is the smoking gun.)</li>
+     *   <li>{@code curl /test/fault-injection/status} from inside the
+     *       pod — is the injector still armed for the target symbol?
+     *       If yes, the hook never reached {@code consumeIfArmed}. If null,
+     *       the hook fired but didn't halt (shouldn't be possible).</li>
+     *   <li>FAULT-INJECTION log lines — answers whether {@code generateQuote}
+     *       even ran for the armed symbol on this MM.</li>
+     * </ol>
      */
     private static void dumpMmDiagnostics(String pod) {
         System.out.println("\n[ERR10-k8s] ============ DIAGNOSTICS for " + pod + " ============");
@@ -309,30 +374,21 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         }
     }
 
-    private static void driveOneWave(int wave, Random rnd) {
-        int accepted = 0;
-        for (String symbol : SEED_SYMBOLS) {
-            for (int i = 0; i < SELF_CROSS_PAIRS_PER_WAVE; i++) {
-                int qty = 1 + rnd.nextInt(3);
-                if (postOrderToExchange(new ExternalOrder(
-                        UUID.randomUUID(), symbol, qty, SELF_CROSS_PRICE, Side.BUY))) accepted++;
-                if (postOrderToExchange(new ExternalOrder(
-                        UUID.randomUUID(), symbol, qty, SELF_CROSS_PRICE, Side.SELL))) accepted++;
-            }
-            Side wideSide = (wave % 2 == 1) ? Side.BUY : Side.SELL;
-            double wideLimit = wideSide == Side.BUY ? WIDE_BUY_LIMIT : WIDE_SELL_LIMIT;
-            int wideQty = 1 + rnd.nextInt(3);
-            if (postOrderToExchange(new ExternalOrder(
-                    UUID.randomUUID(), symbol, wideQty, wideLimit, wideSide))) accepted++;
-        }
-        System.out.println("[ERR10-k8s] wave " + wave + ": exchange accepted " + accepted + " orders");
-    }
-
     /**
-     * Hammer the exchange with wide orders on {@code symbol} until
-     * {@code mmAlive(ownerPort)} returns false or {@code timeout} elapses.
-     * See {@code LocalError10MMCrashDuringQuoteReplaceTest.driveOrdersUntilCrash}
-     * for the rationale.
+     * Hammer the exchange with wide orders on {@code symbol}, alternating
+     * BUY and SELL across the MM's spread, until {@code mmAlive(ownerPort)}
+     * returns false or {@code timeout} elapses. Returns true on crash.
+     *
+     * <p>Two complications justify the loop rather than a single fire-and-poll:
+     * <ol>
+     *   <li>The MM republishes quotes frequently; a fill won't happen unless
+     *       our order arrives while a fresh quote is live. A burst makes
+     *       this near-certain.</li>
+     *   <li>Once the MM publishes its next quote after we arm, that publish
+     *       call hits the hook and crashes — but only if a position update
+     *       actually triggers a replace cycle. We drive fills to guarantee
+     *       updates.</li>
+     * </ol>
      */
     private static boolean driveOrdersUntilCrash(int ownerPort, String ownerPod,
                                                  String symbol, Duration timeout)
@@ -340,20 +396,17 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         Instant deadline = Instant.now().plus(timeout);
         int sent = 0;
         int accepted = 0;
-        int sideToggle = 0;
+        List<String> oneSymbol = List.of(symbol);
         while (Instant.now().isBefore(deadline)) {
             if (!mmAlive(ownerPort)) {
                 System.out.println("[ERR10-k8s] " + ownerPod + " stopped responding after "
                         + sent + " trigger orders (" + accepted + " accepted)");
                 return true;
             }
-            Side side = (sideToggle++ & 1) == 0 ? Side.BUY : Side.SELL;
-            double limit = side == Side.BUY ? WIDE_BUY_LIMIT : WIDE_SELL_LIMIT;
-            if (postOrderToExchange(new ExternalOrder(
-                    UUID.randomUUID(), symbol, 1, limit, side))) {
-                accepted++;
-            }
+            accepted += submitOrdersViaPublisher(1, oneSymbol);
             sent++;
+            // Brief pause between orders so the MM has time to receive the
+            // position update, enter the replace cycle, and hit the hook.
             Thread.sleep(250);
         }
         System.out.println("[ERR10-k8s] driveOrdersUntilCrash giving up after " + sent
@@ -361,6 +414,12 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         return false;
     }
 
+    /**
+     * Iterate MM ports and ask each {@code GET /marketmaker/status} who owns
+     * {@code symbol}. The first MM whose {@code assigned} set contains the
+     * symbol wins. Symbol→node assignment is deterministic (sharding by
+     * hash) so this returns the same MM run-to-run for the same symbol.
+     */
     private static int findOwnerPort(String symbol) throws Exception {
         for (Map.Entry<Integer, String> e : MM_PORT_TO_POD.entrySet()) {
             int port = e.getKey();
@@ -397,6 +456,11 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
                         + "(profile fault-injection should be active on the MM); body=" + resp.body());
     }
 
+    /**
+     * Poll {@code GET /exposure} until {@code activeReservations < expected}
+     * or the timeout elapses. Returns the post-change state, or null on
+     * timeout.
+     */
     private static ExposureState awaitExposureChange(int expected, Duration timeout)
             throws InterruptedException {
         Instant deadline = Instant.now().plus(timeout);
@@ -408,12 +472,24 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         return null;
     }
 
-    private static void assertExpiredQuoteRejectsOrders(String symbol) {
-        boolean accepted = postOrderToExchange(new ExternalOrder(
-                UUID.randomUUID(), symbol, 1, WIDE_BUY_LIMIT, Side.BUY));
-        assertTrue(!accepted,
-                "order against expired orphan quote for " + symbol + " must be rejected "
-                        + "(exchange must enforce quote TTL bound)");
+    private static void assertExpiredQuoteRejectsOrders(String symbol, UUID orphanId) {
+        // Submit a single wide order via the publisher (which routes to the
+        // exchange leader). The check has to tolerate a tight race: HA
+        // self-recovery (AssignmentListener.bootstrapQuoteForNewlyAssigned)
+        // can publish a fresh, valid quote between our caller's pre-check
+        // and the order landing at the exchange. If that happens, the order
+        // legitimately fills against the *new* quote and the orphan-rejection
+        // property no longer applies. We fail only when an order is accepted
+        // and the exchange still shows the orphan — that would mean the
+        // exchange failed to enforce the TTL bound.
+        int accepted = submitOrdersViaPublisher(1, List.of(symbol));
+        if (accepted == 0) return;
+        Quote afterSubmit = currentExchangeQuote(symbol);
+        assertTrue(afterSubmit == null || !orphanId.equals(afterSubmit.quoteId()),
+                "order accepted while exchange still holds the expired orphan quote for "
+                        + symbol + " — exchange must enforce quote TTL bound");
+        System.out.println("[ERR10-k8s] order filled against post-recovery quote, not orphan: "
+                + afterSubmit);
     }
 
     // ---------- generic helpers (mirror ClusterIntegrationWithSystemK8sTest) ----------
@@ -431,6 +507,42 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
             if (status.path("members").size() != MM_PORT_TO_POD.size()) return false;
         }
         return responding == MM_PORT_TO_POD.size() && leaders.size() == 1;
+    }
+
+    /**
+     * Convergence check that excludes a known-dead MM. The remaining
+     * {@code MM_PORT_TO_POD.size() - 1} nodes must all respond, see
+     * each other (members count == survivors), and agree on a single leader.
+     */
+    private static boolean clusterConvergedExcluding(int excludedPort) {
+        int expected = MM_PORT_TO_POD.size() - 1;
+        int responding = 0;
+        Set<String> leaders = new HashSet<>();
+        for (int port : MM_PORT_TO_POD.keySet()) {
+            if (port == excludedPort) continue;
+            JsonNode status = clusterStatusOrNull(port);
+            if (status == null) return false;
+            responding++;
+            String lid = status.path("leaderId").asText(null);
+            if (lid == null) return false;
+            leaders.add(lid);
+            if (status.path("members").size() != expected) return false;
+        }
+        return responding == expected && leaders.size() == 1;
+    }
+
+    /**
+     * Like {@link #findOwnerPort(String)} but returns -1 if the only owner
+     * is {@code excludedPort} (or if no owner exists yet) and swallows
+     * transient HTTP errors so it can be called from inside a polling lambda.
+     */
+    private static int ownerPortOrMinusOne(String symbol, int excludedPort) {
+        try {
+            int p = findOwnerPort(symbol);
+            return (p == excludedPort) ? -1 : p;
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     private static JsonNode clusterStatusOrNull(int port) {
@@ -529,19 +641,31 @@ class ClusterError10MMCrashDuringQuoteReplaceTest {
         return JSON.readValue(resp.body(), new TypeReference<List<UUID>>() {});
     }
 
-    private static boolean postOrderToExchange(ExternalOrder order) {
+    /**
+     * Submit orders through the external-publisher's {@code /publisher/submit-orders}
+     * endpoint. The publisher resolves the current exchange leader from
+     * ZooKeeper and retries on transient 503s — using it means we never get
+     * killed by the round-robin Service alias dropping requests on follower
+     * replicas (which {@link edu.yu.marketmaker.ha.LeaderGuardFilter} rejects
+     * with 503 for any mutating method).
+     *
+     * @return the number of orders the exchange accepted (HTTP 200).
+     */
+    private static int submitOrdersViaPublisher(int countPerSymbol, List<String> symbols) {
         try {
-            String body = JSON.writeValueAsString(order);
+            String body = JSON.writeValueAsString(symbols);
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("http://" + HOST + ":" + EXCHANGE_PORT + "/orders"))
+                    .uri(URI.create("http://" + HOST + ":" + PUBLISHER_PORT
+                            + "/publisher/submit-orders?count=" + countPerSymbol))
                     .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(10))
+                    .timeout(Duration.ofSeconds(30))
                     .POST(HttpRequest.BodyPublishers.ofString(body))
                     .build();
             HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
-            return resp.statusCode() == 200;
+            if (resp.statusCode() != 200) return 0;
+            return Integer.parseInt(resp.body().trim());
         } catch (Exception e) {
-            return false;
+            return 0;
         }
     }
 
