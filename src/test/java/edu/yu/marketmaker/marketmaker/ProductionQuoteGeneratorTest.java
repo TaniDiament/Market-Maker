@@ -5,6 +5,7 @@ import edu.yu.marketmaker.model.*;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.messaging.rsocket.RSocketRequester;
 import reactor.core.publisher.Mono;
 
@@ -49,7 +50,10 @@ class ProductionQuoteGeneratorTest {
         when(requestSpec.data(any())).thenReturn(requestSpec);
         when(quoteRepository.get(anyString())).thenReturn(Optional.empty());
 
-        generator = new ProductionQuoteGenerator(builder, quoteRepository, "localhost", 7000, DEFAULT_QTY, TARGET_SPREAD);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<FaultInjector> emptyProvider = mock(ObjectProvider.class);
+        when(emptyProvider.getIfAvailable()).thenReturn(null);
+        generator = new ProductionQuoteGenerator(builder, quoteRepository, "localhost", 7000, DEFAULT_QTY, TARGET_SPREAD, emptyProvider);
     }
 
     private void stubReservation(int grantedBid, int grantedAsk) {
