@@ -1,9 +1,7 @@
 package edu.yu.marketmaker.persistence;
 
 import edu.yu.marketmaker.model.Quote;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Id;
-import jakarta.persistence.Table;
+import jakarta.persistence.*;
 
 import java.util.UUID;
 
