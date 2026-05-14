@@ -216,22 +216,34 @@ class LocalError10MMCrashDuringQuoteReplaceTest {
         System.out.println("[ERR10] " + ownerService + " confirmed crashed (~" +
                 (crashObservedMillis - crashTriggerMillis) + "ms after first trigger)");
 
-        // 8. Post-crash exposure snapshot. We do NOT assert on a drop in
-        //    activeReservations: when the FaultInjector frees AAPL's
-        //    capacity, other MMs whose quote-replace cycles had been
-        //    receiving PARTIAL/DENIED grants (or HA-failover for the
-        //    target symbol itself) immediately take the freed slot. The
-        //    activeReservations counter rarely shows a transient drop at
-        //    our 250ms polling granularity. The release-before-crash half
-        //    of error case 10 is proven by the FaultInjector log line
-        //    "[FAULT-INJECTION] release returned freed=… for symbol=AAPL"
-        //    in the MM container logs (visible via dumpMmDiagnostics on
-        //    failure); the bad state we assert below is the *externally
-        //    visible* one — the exchange still holds the orphan quote
-        //    even though no MM has a backing reservation for it.
+        // 8. Observe the *documented* error-case-10 inconsistency: the
+        //    pre-crash quote is still in the exchange while the reservation
+        //    backing it has been released. The window opens the moment the
+        //    FaultInjector's release call returns and closes when either
+        //    (a) the orphan quote's TTL fires, or (b) HA failover reassigns
+        //    the symbol and the new owner republishes (which also requests
+        //    a fresh reservation). We poll on 100ms granularity for up to
+        //    5 seconds so a fast HA failover doesn't beat us to the punch.
+        boolean leakObserved = pollOrphanWithoutReservation(
+                TARGET_SYMBOL, preCrashQuote.quoteId(), preCrashActive,
+                Duration.ofSeconds(5));
         ExposureState postCrashExposure = currentExposure();
-        System.out.println("[ERR10] post-crash exposure (informational only, not asserted): "
-                + postCrashExposure);
+        if (leakObserved) {
+            System.out.println("[ERR10] CONFIRMED error-case-10 invariant violation: "
+                    + "exchange held orphan quoteId=" + preCrashQuote.quoteId()
+                    + " while activeReservations < " + preCrashActive
+                    + " (proves release-then-crash sequence)");
+        } else {
+            // HA failover beat the observation window — strictly better than
+            // the documented ≤30s TTL bound. We can't *prove* the leak in
+            // this run, but the FAULT-INJECTION log lines in the dead MM
+            // container show the release call did fire. Print the dead
+            // MM's logs so a CI reviewer can verify out-of-band.
+            System.out.println("[ERR10] leak window not directly observed at 100ms granularity "
+                    + "(HA failover faster than measurement). FaultInjector logs follow:");
+            dumpMmDiagnostics(ownerService);
+        }
+        System.out.println("[ERR10] post-crash exposure: " + postCrashExposure);
 
         Quote orphanQuote = currentExchangeQuote(TARGET_SYMBOL);
         assertNotNull(orphanQuote,
@@ -484,19 +496,32 @@ class LocalError10MMCrashDuringQuoteReplaceTest {
     }
 
     /**
-     * Poll {@code GET /exposure} until {@code activeReservations < expected}
-     * or the timeout elapses. Returns the post-change state, or null on
-     * timeout.
+     * Try to catch the error-case-10 inconsistency: the pre-crash quote
+     * still resident in the exchange AND the global reservation count
+     * dropped from {@code preCrashActive}. Both conditions must hold
+     * simultaneously in a single poll — observing them across separate
+     * polls would not rule out a fast "orphan replaced THEN new
+     * reservation created" sequence and wouldn't prove the leak.
+     *
+     * <p>100ms granularity, capped at {@code timeout}. Returns true the
+     * first poll that catches the inconsistency.
      */
-    private static ExposureState awaitExposureChange(int expected, Duration timeout)
+    private static boolean pollOrphanWithoutReservation(String symbol,
+                                                       UUID preCrashQuoteId,
+                                                       int preCrashActive,
+                                                       Duration timeout)
             throws InterruptedException {
         Instant deadline = Instant.now().plus(timeout);
         while (Instant.now().isBefore(deadline)) {
-            ExposureState state = currentExposure();
-            if (state != null && state.activeReservations() < expected) return state;
-            Thread.sleep(250);
+            Quote q = currentExchangeQuote(symbol);
+            ExposureState e = currentExposure();
+            if (q != null && preCrashQuoteId.equals(q.quoteId())
+                    && e != null && e.activeReservations() < preCrashActive) {
+                return true;
+            }
+            Thread.sleep(100);
         }
-        return null;
+        return false;
     }
 
     private static void assertExpiredQuoteRejectsOrders(String symbol, UUID orphanId) {

@@ -1,7 +1,7 @@
 package edu.yu.marketmaker.marketmaker;
 
+import edu.yu.marketmaker.cluster.ClusterNode;
 import edu.yu.marketmaker.ha.LeaderAwareRSocketClient;
-import edu.yu.marketmaker.ha.LeaderElectionService;
 import edu.yu.marketmaker.model.StateSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,7 +16,7 @@ import java.util.*;
 import java.util.concurrent.*;
 
 @Component
-@Profile("!test-position-tracker")
+@Profile("market-maker-node & !test-position-tracker")
 public class PositionTracker implements SnapshotTracker {
 
     private static final Logger log = LoggerFactory.getLogger(PositionTracker.class);
@@ -27,11 +27,11 @@ public class PositionTracker implements SnapshotTracker {
     private final Set<String> trackedSymbols = ConcurrentHashMap.newKeySet();
 
     private final LeaderAwareRSocketClient client;
-    private final LeaderElectionService leaderElection;
+    private final ClusterNode clusterNode;
 
-    public PositionTracker(LeaderAwareRSocketClient client, LeaderElectionService leaderElection) {
+    public PositionTracker(LeaderAwareRSocketClient client, ClusterNode clusterNode) {
         this.client = client;
-        this.leaderElection = leaderElection;
+        this.clusterNode = clusterNode;
     }
 
     @Override
@@ -58,8 +58,8 @@ public class PositionTracker implements SnapshotTracker {
     }
 
     public Flux<StateSnapshot> getPositions() {
-        // The leader has no assigned symbols; don't subscribe.
-        if (leaderElection.isLeader()) {
+        // The cluster leader coordinates assignments and is not assigned symbols; don't subscribe.
+        if (clusterNode.isLeader()) {
             log.debug("Skipping state.stream subscription: this node is the leader");
             return Flux.empty();
         }
