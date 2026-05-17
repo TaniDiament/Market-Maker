@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Market Maker — Positions</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background:#0f1115; color:#e6e6e6; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  #status { display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; margin-left:12px; vertical-align:middle; }
+  .ok { background:#1f6f3f; }
+  .bad { background:#7a1f1f; }
+  table { border-collapse: collapse; width: 100%; max-width: 900px; }
+  th, td { padding: 8px 12px; text-align: right; border-bottom: 1px solid #2a2e36; font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color:#9aa0a6; font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  tbody tr.flash { animation: flash 0.8s ease-out; }
+  @keyframes flash { from { background:#3a4a2a; } to { background: transparent; } }
+  .pos { color:#5fbf5f; }
+  .neg { color:#e07070; }
+  .dim { color:#6b7280; }
+</style>
+</head>
+<body>
+  <h1>Positions <span id="status" class="bad">connecting…</span></h1>
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Net Qty</th><th>Version</th>
+        <th>Last Trade</th><th>Bid</th><th>Ask</th><th>Last Fill ID</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+<script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7.0.0/bundles/stomp.umd.min.js"></script>
+<script>
+  const rowsEl = document.getElementById('rows');
+  const statusEl = document.getElementById('status');
+  const state = new Map(); // symbol -> { position, fill, quote }
+
+  function setStatus(text, ok) {
+    statusEl.textContent = text;
+    statusEl.className = ok ? 'ok' : 'bad';
+  }
+
+  function render(symbol, flash) {
+    const s = state.get(symbol);
+    if (!s) return;
+    const id = 'r-' + symbol;
+    let tr = document.getElementById(id);
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.id = id;
+      rowsEl.appendChild(tr);
+    }
+    const qty = s.position.netQuantity;
+    const qtyClass = qty > 0 ? 'pos' : qty < 0 ? 'neg' : 'dim';
+    const last = s.fill ? s.fill.price.toFixed(2) : '<span class="dim">—</span>';
+    const bid = s.quote ? s.quote.bidPrice.toFixed(2) : '<span class="dim">—</span>';
+    const ask = s.quote ? s.quote.askPrice.toFixed(2) : '<span class="dim">—</span>';
+    const fillId = s.position.lastFillId ? s.position.lastFillId.slice(0, 8) : '';
+    tr.innerHTML = `
+      <td>${symbol}</td>
+      <td class="${qtyClass}">${qty}</td>
+      <td class="dim">${s.position.version}</td>
+      <td>${last}</td>
+      <td>${bid}</td>
+      <td>${ask}</td>
+      <td class="dim">${fillId}</td>`;
+    if (flash) {
+      tr.classList.remove('flash');
+      void tr.offsetWidth;
+      tr.classList.add('flash');
+    }
+  }
+
+  async function refreshQuote(symbol) {
+    try {
+      const res = await fetch('/quotes/' + encodeURIComponent(symbol));
+      if (!res.ok) return;
+      const quote = await res.json();
+      const s = state.get(symbol);
+      if (s) { s.quote = quote; render(symbol, false); }
+    } catch (e) { /* ignore */ }
+  }
+
+  function applySnapshot(snap, flash) {
+    const sym = snap.position.symbol;
+    state.set(sym, {
+      position: snap.position,
+      fill: snap.fill ?? state.get(sym)?.fill ?? null,
+      quote: state.get(sym)?.quote ?? null,
+    });
+    render(sym, flash);
+    refreshQuote(sym);
+  }
+
+  const client = new StompJs.Client({
+    webSocketFactory: () => new SockJS('/ws'),
+    reconnectDelay: 2000,
+    onConnect: () => {
+      setStatus('connected to leader', true);
+      client.subscribe('/app/positions.snapshot', m => {
+        const snapshots = JSON.parse(m.body);
+        snapshots.forEach(s => applySnapshot(s, false));
+      });
+      client.subscribe('/topic/positions', m => {
+        applySnapshot(JSON.parse(m.body), true);
+      });
+    },
+    onWebSocketClose: () => setStatus('disconnected — retrying', false),
+    onStompError: f => setStatus('stomp error: ' + f.headers.message, false),
+  });
+  client.activate();
+</script>
+</body>
+</html>
