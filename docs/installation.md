@@ -82,50 +82,45 @@ docker save -o dist/images.tar `
 > **Shortcut:** `bash ./scripts/build-offline-bundle.sh` runs steps 1 + 2 + 3 in one shot (requires WSL or git-bash for the bash interpreter).
 
 > **Note:** `local-path-provisioner` and `mirrored-library-busybox` are required for the postgres and ZK PVCs to bind on an air-gapped cluster — without them, every JPA service in the stack will CrashLoopBackOff because postgres never reaches Ready, and ZK will lose every znode on each pod restart because its `/data` mount has nothing to back it. The exact tags above match this cluster's installed K3s; if K3s is upgraded, re-run `kubectl get deploy -n kube-system local-path-provisioner -o jsonpath='{...}'` to confirm the tags before bundling.
+
 ### B. Distribute and Import (Connected to Cluster)
-Run 
+
 ```powershell
-.\scripts\distribute-images.ps1. 
+.\scripts\distribute-images.ps1
 ```
+
 This script:
 
 1) scps the 500MB+ images.tar to every node.
 
-2) Imports images into the k8s.io namespace using doas k3s ctr -n k8s.io images import.
+2) Imports images into the k8s.io namespace using `doas k3s ctr -n k8s.io images import`.
 
 ## Step 5: Application Deployment
-1) Transfer Manifests to cp1:
-Run 
+1) Transfer manifests to cp1:
+
 ```powershell
 ssh sack@192.168.8.11 "mkdir -p /home/sack/marketmaker"
 scp -r ./k8s sack@192.168.8.11:/home/sack/marketmaker/k8s
 ```
+
 2) Apply via Kustomize:
+
 ```powershell
-ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/marketmaker/k8s/"```
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/marketmaker/k8s/"
+```
 
 > **Upgrading from a pre-PVC ZK install:** the `zk` StatefulSet now declares `volumeClaimTemplates` so znodes survive pod restarts. Kubernetes does **not** allow adding `volumeClaimTemplates` to an existing StatefulSet; if `kubectl apply` reports `Forbidden` on the `zk` resource, delete the StatefulSet first (no app data is at risk — ZK was non-persistent before, so its znodes are already ephemeral): `kubectl -n market-maker delete statefulset zk`, then re-apply.
 
 ---
 
 ## Step 6: Updating the Application Image (Code → Cluster)
-Use this workflow whenever Java source under `src/main/` changes. Manifest-only changes (`k8s/*.yaml`) need only steps 4 and 5 from this section; you can skip the rebuild.
+Use this workflow whenever Java source under `src/main/` changes. Manifest-only changes (`k8s/*.yaml`) need only sub-steps D and E from this section; you can skip the rebuild.
 
 ### A. Rebuild the image on your laptop
 ```powershell
-mvn -DskipTests clean package
-docker build -f Dockerfile.offline -t market-maker:1.0.0 .
-docker save -o dist/images.tar `
-  market-maker:1.0.0 `
-  eclipse-temurin:21-jre-alpine `
-  postgres:16-alpine `
-  zookeeper:3.9 `
-  rancher/mirrored-pause:3.6 `
-  rancher/local-path-provisioner:v0.0.35 `
-  rancher/mirrored-library-busybox:1.37.0 `
-  ghcr.io/headlamp-k8s/headlamp:v0.39.0
+bash ./scripts/build-offline-bundle.sh
 ```
-The third-party images already exist locally from Step 4, so the `docker save` is fast — only the new `market-maker:1.0.0` layer is freshly written. The script `bash ./scripts/build-offline-bundle.sh` does the same in one shot.
+Same build + tarball workflow as Step 4.A, but the third-party images already exist locally so only the new `market-maker:1.0.0` layer is freshly written — the script finishes in seconds. (Equivalent to running the explicit `mvn package` + `docker build` + `docker save` block in Step 4.A by hand.)
 
 ### B. Purge the stale image on every node
 This is the step that's easy to forget. The MM pods use `imagePullPolicy: IfNotPresent`, and the new tarball still tags the image as `market-maker:1.0.0`, so containerd happily keeps the *old* layer cached and ignores the new one. You must explicitly remove the cached image first:
@@ -180,18 +175,13 @@ Monitor status from cp1:
 doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n market-maker -o wide
 ```
 
-## Critical ZooKeeper Fixes in zookeeper.yaml:
+### Critical ZooKeeper fixes in zookeeper.yaml
 
-### Parallel Startup: 
-Set `podManagementPolicy: Parallel` in the `StatefulSet` to avoid the "OrderedReady" deadlock.
+- **Parallel startup**: `podManagementPolicy: Parallel` in the `StatefulSet` avoids the "OrderedReady" deadlock.
+- **DNS resolution**: `publishNotReadyAddresses: true` in the `zk-hs` service lets peers resolve each other's IPs before they are healthy.
+- **Anti-affinity**: ZK pods are pinned to `cp1`, `cp2`, and `cp3` to separate the coordination layer from worker traffic.
 
-### DNS Resolution: 
-Set `publishNotReadyAddresses: true` in the `zk-hs` service so peers can resolve each other's IPs before they are healthy.
-
-### Anti-Affinity: 
-Ensure ZK pods are pinned to `cp1`, `cp2`, and `cp3` to separate the coordination layer from worker traffic.
-
-## Startup Ordering (mm initContainers):
+### Startup ordering (mm initContainers)
 The `mm` StatefulSet runs two `initContainers` (`wait-for-zk`, `wait-for-postgres`, both using `rancher/mirrored-library-busybox:1.37.0`) that block the app from starting until:
 
 1. All three ZK peers respond `imok` on port 2181 (quorum is reachable).
@@ -199,22 +189,14 @@ The `mm` StatefulSet runs two `initContainers` (`wait-for-zk`, `wait-for-postgre
 
 This eliminates the prior race where `mm` would CrashLoop until kubelet backoff happened to land after ZK election / postgres bind. If `mm` pods sit in `Init:0/2` for more than a minute, check `kubectl logs mm-0 -c wait-for-zk` (or `-c wait-for-postgres`) on cp1 — the loop prints which host it is still waiting on.
 
-## Pod Reset (fallback):
-If `mm` pods are still in `CrashLoopBackOff` after ZK and postgres are Ready, force a restart:
-Run on cp1:
+### Pod reset (fallback)
+If `mm` pods are still in `CrashLoopBackOff` after ZK and postgres are Ready, force a restart on cp1:
 ```powershell
 doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete pods -l app=mm -n market-maker
 ```
 
 ## Step 8: Headlamp Cluster UI
-A web UI for inspecting cluster state is deployed alongside the application via `k8s/headlamp.yaml` and exposed on **NodePort 30090** of every node.
-
-1) Browse to `http://192.168.8.11:30090` (or any other node IP).
-2) Generate a login token from cp1 and paste it into Headlamp's token field:
-```powershell
-ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker create token headlamp"
-```
-The token is bound to a `cluster-admin` ClusterRoleBinding so Headlamp can see all namespaces (kube-system, market-maker, etc). Tokens are short-lived; re-run the command above to refresh.
+A web Kubernetes dashboard (Headlamp) is deployed via `k8s/headlamp.yaml` and exposed on **NodePort 30090** of every node — browse to `http://192.168.8.11:30090` (or any other node IP). See **Appendix A** for the login flow, day-to-day workflow, and cluster-specific caveats.
 
 ## Step 9: Stopping the Application (Without Stopping the Cluster)
 Use this when you want to free cluster resources or pause the app between dev sessions, but you want to keep K3s itself running so other workloads stay healthy and you don't have to wait for a full cluster restart.
@@ -268,12 +250,13 @@ Execute `ClusterIntegrationWithSystemK8sTest.java`.
 
 1) Network: Connect laptop to the Mango Router.
 
-2) IntelliJ VM Options: You must point the test to the physical IP. Add this to your Run Configuration:
+2) IntelliJ VM options: point the test at a physical node IP by adding this to your Run Configuration:
 
-Plaintext
-`-Dcluster.k8s.host=192.168.8.11`
+```
+-Dcluster.k8s.host=192.168.8.11
+```
 
-3) Run: The test will interface with the cluster, injecting orders and validating distributed state across the 14 nodes.
+3) Run: the test will interface with the cluster, injecting orders and validating distributed state across the 14 nodes.
 
 ---
 
@@ -296,7 +279,7 @@ After authenticating, the most useful views for this stack:
 
 - **Workloads → Pods** (filter namespace to `market-maker`): live status of `mm-0..mm-6`, `trading-state`, `exchange`, `exposure-reservation`, `external-publisher`, `postgres-0`, `zk-0..zk-2`. Click a pod to open its **Logs** tab — the same output `kubectl logs` would give, streamed live, with a **Previous** toggle for inspecting the last crashed container during a CrashLoopBackOff.
 - **Workloads → StatefulSets**: the `mm` StatefulSet has a **Scale** button — useful for shrinking to 1 replica during a debug session and scaling back to 7. Pod identity (`mm-0` … `mm-N`) is preserved, so the symbol-shard assignment in ZK stays stable.
-- **Storage → Persistent Volume Claims**: confirms `data-postgres-0` is `Bound`. If it's `Pending`, see *Step 5* — usually the local-path-provisioner image isn't on the node yet.
+- **Storage → Persistent Volume Claims**: confirms `data-postgres-0` is `Bound`. If it's `Pending`, see *Step 4.A* — usually the local-path-provisioner image isn't on the node yet.
 - **Cluster → Nodes**: 14 entries (cp1-cp3, n1-n12 minus n107). A node with `NotReady` here is your first signal something is wrong with k3s itself before you start digging into application logs.
 - **Network → Services**: shows the NodePorts (30081-30087 for `mm-N-np`, 30180-30183 for the support services, 30090 for Headlamp itself) — handy when you forget which port maps to which pod from outside the cluster.
 - **Config → ConfigMaps**: `symbols`, `hazelcast-members`. Editing in-place from the UI takes effect on the next pod restart, useful for adding a symbol without re-applying the kustomization.
@@ -318,3 +301,42 @@ If the UI suddenly reports 401s on every panel, the token expired. Re-run the `k
 - **Air-gapped pulls**: Headlamp's image (`ghcr.io/headlamp-k8s/headlamp:v0.39.0`) must be in `dist/images.tar` and distributed via `.\scripts\distribute-images.ps1`. If the pod is `ImagePullBackOff`, that's the cause — re-run the distribute step.
 - **One Headlamp pod, one node**: there's only 1 replica. If the node hosting it goes down, NodePort 30090 on *other* nodes still routes correctly (k3s's klipper-lb forwards to wherever the pod actually is), but during the eviction/reschedule window the UI is briefly unavailable. Bumping `replicas: 2` in `headlamp.yaml` is fine if you want HA — Headlamp itself is stateless.
 - **No persistent settings**: Headlamp stores user preferences in the browser, so cluster bookmarks / saved filters disappear if you switch laptops. Nothing to back up.
+
+---
+
+## Appendix B: Connecting to the Position UI
+
+The Position UI is a single-page dashboard (`src/main/resources/static/index.html`) served by the **`trading-state`** service. There is no separate `position-ui` deployment in the cluster — the standalone `position-ui` Spring profile (and its `compose.yml` service) is for local Docker Compose only. On k3s, the same web page is bundled with `trading-state` and reached through its NodePort.
+
+### Address
+
+Browse to NodePort **30180** on any cluster node:
+
+```
+http://192.168.8.11:30180/
+```
+
+Any node IP works equally — k3s's klipper-lb forwards to whichever pod the `trading-state` Service currently selects. Cp1 is convenient because it is already the SSH entry point; cp2/cp3 (`192.168.8.12`, `192.168.8.13`) and the workers (`192.168.8.101`–`.112`, skipping `.107`) all resolve to the same UI.
+
+### What the page shows
+
+A live table keyed by symbol with columns: **Symbol**, **Net Qty**, **Version**, **Last Trade**, **Bid**, **Ask**, **Last Fill ID**. New fills cause the affected row to flash. The status pill in the header reads `connected to leader` when the WebSocket is healthy and `disconnected — retrying` otherwise.
+
+Backing endpoints on the same pod (handy for `curl` checks):
+
+| Method | Path                  | Purpose                                                                             |
+| ------ | --------------------- | ----------------------------------------------------------------------------------- |
+| GET    | `/positions`          | All positions (JSON)                                                                |
+| GET    | `/positions/{symbol}` | Single position                                                                     |
+| GET    | `/quotes/{symbol}`    | Latest bid/ask (used to populate a row)                                             |
+| GET    | `/state/fills`        | Fill history                                                                        |
+| GET    | `/leader-info`        | Which `trading-state` replica is leader                                             |
+| GET    | `/health`             | Liveness/readiness (same path the probe uses)                                       |
+| WS     | `/ws` (SockJS+STOMP)  | `/app/positions.snapshot` for the initial dump, `/topic/positions` for live updates |
+
+### Caveats specific to this cluster
+
+- **Leader-only push**: only the elected `trading-state` leader publishes to `/topic/positions`. The NodePort balances across all 3 replicas, but each replica re-broadcasts the leader's snapshots, so the UI works identically no matter which pod the WebSocket lands on. If the status pill stays on `disconnected — retrying` after a few seconds, check `kubectl -n market-maker get pods -l app=trading-state` — if zero are Ready, ZK or Postgres is the upstream cause (see *Step 7*).
+- **CDN dependencies**: the page loads `sockjs-client` and `@stomp/stompjs` from `cdn.jsdelivr.net`. The browser making the request needs outbound internet — the cluster itself doesn't. On an air-gapped laptop the table will render empty (the page loads from the cluster, the JS doesn't), and the browser console will show `net::ERR_*` for jsdelivr.
+- **Symbol set**: rows appear only for symbols with at least one fill recorded. To populate the dashboard from a fresh deploy, drive traffic via the integration test (`-Dcluster.k8s.host=192.168.8.11`) or `POST` fills to `trading-state` directly.
+- **No auth**: unlike Headlamp, the Position UI has no token — anyone on the `192.168.8.x` subnet who can reach `:30180` can view positions. The Mango Router boundary is the only access control.
