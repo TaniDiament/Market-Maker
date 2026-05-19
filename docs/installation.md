@@ -62,8 +62,9 @@ docker pull zookeeper:3.9
 docker pull rancher/mirrored-pause:3.6
 docker pull rancher/local-path-provisioner:v0.0.35
 docker pull rancher/mirrored-library-busybox:1.37.0
-docker pull ghcr.io/headlamp-k8s/headlamp:v0.39.0
 ```
+
+Headlamp is **not** part of this bundle anymore — it has its own tarball and apply step. See **Step 8**.
 
 **3. Save everything into one tarball:**
 
@@ -75,8 +76,7 @@ docker save -o dist/images.tar `
   zookeeper:3.9 `
   rancher/mirrored-pause:3.6 `
   rancher/local-path-provisioner:v0.0.35 `
-  rancher/mirrored-library-busybox:1.37.0 `
-  ghcr.io/headlamp-k8s/headlamp:v0.39.0
+  rancher/mirrored-library-busybox:1.37.0
 ```
 
 > **Shortcut:** `bash ./scripts/build-offline-bundle.sh` runs steps 1 + 2 + 3 in one shot (requires WSL or git-bash for the bash interpreter).
@@ -196,7 +196,41 @@ doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl delete pods -l app=mm -n m
 ```
 
 ## Step 8: Headlamp Cluster UI
-A web Kubernetes dashboard (Headlamp) is deployed via `k8s/headlamp.yaml` and exposed on **NodePort 30090** of every node — browse to `http://192.168.8.11:30090` (or any other node IP). See **Appendix A** for the login flow, day-to-day workflow, and cluster-specific caveats.
+A web Kubernetes dashboard (Headlamp) is deployed from `k8s/headlamp/` into its own `headlamp` namespace and exposed on **NodePort 30090** of every node. It is shipped as a **separate image bundle** so the main `dist/images.tar` stays focused on application images.
+
+### A. Build the Headlamp tarball (laptop with internet, one-time)
+
+```powershell
+docker pull ghcr.io/headlamp-k8s/headlamp:v0.39.0
+docker save -o dist/headlamp.tar ghcr.io/headlamp-k8s/headlamp:v0.39.0
+```
+
+### B. Distribute and import on every node
+
+```powershell
+$nodes = @(
+  "192.168.8.11","192.168.8.12","192.168.8.13",
+  "192.168.8.101","192.168.8.102","192.168.8.103",
+  "192.168.8.104","192.168.8.105","192.168.8.106",
+  "192.168.8.109","192.168.8.110","192.168.8.111","192.168.8.112"
+)
+foreach ($n in $nodes) {
+  ssh "sack@${n}" "mkdir -p /home/sack/marketmaker"
+  scp dist/headlamp.tar "sack@${n}:/home/sack/marketmaker/headlamp.tar"
+  ssh -t "sack@${n}" "doas k3s ctr -n k8s.io images import /home/sack/marketmaker/headlamp.tar"
+}
+```
+
+### C. Apply the kustomization
+
+```powershell
+scp -r ./k8s sack@192.168.8.11:/home/sack/marketmaker/k8s
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl apply -k /home/sack/marketmaker/k8s/headlamp/"
+```
+
+This creates the `headlamp` namespace, ServiceAccount `headlamp`, ClusterRoleBinding `headlamp-ns-admin` → `cluster-admin`, the Deployment, and the NodePort Service on 30090.
+
+Browse to `http://192.168.8.11:30090` (or any other node IP). See **Appendix A** for the login flow, day-to-day workflow, and cluster-specific caveats.
 
 ## Step 9: Stopping the Application (Without Stopping the Cluster)
 Use this when you want to free cluster resources or pause the app between dev sessions, but you want to keep K3s itself running so other workloads stay healthy and you don't have to wait for a full cluster restart.
@@ -262,14 +296,14 @@ Execute `ClusterIntegrationWithSystemK8sTest.java`.
 
 ## Appendix A: Using Headlamp
 
-Headlamp is a web-based Kubernetes dashboard. For this cluster it is exposed on **NodePort 30090** of every node and authenticates with a bearer token tied to the `headlamp` ServiceAccount in the `market-maker` namespace (granted `cluster-admin` via a ClusterRoleBinding).
+Headlamp is a web-based Kubernetes dashboard. For this cluster it is exposed on **NodePort 30090** of every node and authenticates with a bearer token tied to the `headlamp` ServiceAccount in the `headlamp` namespace (granted `cluster-admin` via the `headlamp-ns-admin` ClusterRoleBinding).
 
 ### Logging In
 1. Open `http://192.168.8.11:30090` (or any other node IP from the IP map) in a browser on a laptop attached to the Mango Router.
 2. The login screen will ask for a **Cluster** and a **Token**. Leave the cluster picker on its default ("main"); it's the only entry the in-cluster build knows about.
 3. Generate a token from cp1:
    ```powershell
-   ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker create token headlamp"
+   ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n headlamp create token headlamp"
    ```
    Tokens default to ~1 hour. For longer sessions, append `--duration=24h`.
 4. Paste the token, click **Authenticate**.
@@ -298,8 +332,8 @@ wget -qO- http://localhost:8080/actuator/health   # what the kubelet probe sees
 If the UI suddenly reports 401s on every panel, the token expired. Re-run the `kubectl create token` command and paste the new value via the **Settings → Cluster Settings → Token** field — no need to log out fully.
 
 ### Caveats Specific to This Cluster
-- **Air-gapped pulls**: Headlamp's image (`ghcr.io/headlamp-k8s/headlamp:v0.39.0`) must be in `dist/images.tar` and distributed via `.\scripts\distribute-images.ps1`. If the pod is `ImagePullBackOff`, that's the cause — re-run the distribute step.
-- **One Headlamp pod, one node**: there's only 1 replica. If the node hosting it goes down, NodePort 30090 on *other* nodes still routes correctly (k3s's klipper-lb forwards to wherever the pod actually is), but during the eviction/reschedule window the UI is briefly unavailable. Bumping `replicas: 2` in `headlamp.yaml` is fine if you want HA — Headlamp itself is stateless.
+- **Air-gapped pulls**: Headlamp's image (`ghcr.io/headlamp-k8s/headlamp:v0.39.0`) is shipped in its **own** tarball (`dist/headlamp.tar`), separate from the main `dist/images.tar`. If the pod is `ErrImageNeverPull` or `ImagePullBackOff`, re-run **Step 8.A / 8.B** to rebuild and re-import the Headlamp tar on every node.
+- **One Headlamp pod, one node**: there's only 1 replica. If the node hosting it goes down, NodePort 30090 on *other* nodes still routes correctly (k3s's klipper-lb forwards to wherever the pod actually is), but during the eviction/reschedule window the UI is briefly unavailable. Bumping `replicas: 2` in `k8s/headlamp/headlamp.yaml` is fine if you want HA — Headlamp itself is stateless.
 - **No persistent settings**: Headlamp stores user preferences in the browser, so cluster bookmarks / saved filters disappear if you switch laptops. Nothing to back up.
 
 ---
