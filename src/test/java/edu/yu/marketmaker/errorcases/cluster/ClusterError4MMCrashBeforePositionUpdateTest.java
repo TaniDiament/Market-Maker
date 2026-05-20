@@ -75,7 +75,8 @@ class ClusterError4MMCrashBeforePositionUpdateTest {
 
         kill(victimPod);
         assertTrue(submitSyntheticFill(observedSymbol),
-                "trading-state did not accept the position update while " + victimPod + " was down");
+                "trading-state did not accept the position update while " + victimPod + " was down"
+                        + (lastSyntheticFillFailure.isEmpty() ? "" : " — last response: " + lastSyntheticFillFailure));
         awaitCondition(Duration.ofMinutes(2),
                 () -> survivorsConverged(
                         victimPort, MM_PORT_TO_POD.size() - 1),
@@ -95,7 +96,8 @@ class ClusterError4MMCrashBeforePositionUpdateTest {
 
         kill(victimPod);
         assertTrue(submitSyntheticFill(observedSymbol),
-                "trading-state did not accept the position update while " + victimPod + " was down");
+                "trading-state did not accept the position update while " + victimPod + " was down"
+                        + (lastSyntheticFillFailure.isEmpty() ? "" : " — last response: " + lastSyntheticFillFailure));
         awaitCondition(Duration.ofMinutes(2),
                 () -> survivorsConverged(
                         victimPort, MM_PORT_TO_POD.size() - 1),
@@ -316,7 +318,19 @@ class ClusterError4MMCrashBeforePositionUpdateTest {
         return Integer.parseInt(resp.body().trim());
     }
 
+    /**
+     * Inject a Fill via the {@code trading-state} NodePort to simulate the
+     * position update that error case 4 says arrives while the target MM is
+     * down. The NodePort fans out across the 3 trading-state replicas and
+     * {@link edu.yu.marketmaker.ha.LeaderGuardFilter} 503-rejects mutating
+     * writes on the two standbys, so a single-shot POST has only ~1/3 chance
+     * of landing on the leader. Retry past the standbys (each retry re-rolls
+     * the iptables hash) until one attempt is accepted or the budget runs
+     * out; surface the last observed status / body on the assertion side so
+     * a real failure isn't masked as "trading-state was busy."
+     */
     static boolean submitSyntheticFill(String symbol) {
+        lastSyntheticFillFailure = "";
         try {
             Map<String, Object> body = Map.of(
                     "orderId", UUID.randomUUID().toString(),
@@ -327,17 +341,35 @@ class ClusterError4MMCrashBeforePositionUpdateTest {
                     "quoteId", UUID.randomUUID().toString(),
                     "createdAt", System.currentTimeMillis()
             );
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(uri(TRADING_STATE_PORT, "/state/fills"))
-                    .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(5))
-                    .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)))
-                    .build();
-            return HTTP.send(req, HttpResponse.BodyHandlers.ofString()).statusCode() == 200;
+            String payload = JSON.writeValueAsString(body);
+            Instant deadline = Instant.now().plus(Duration.ofSeconds(15));
+            int attempts = 0;
+            while (Instant.now().isBefore(deadline)) {
+                attempts++;
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(uri(TRADING_STATE_PORT, "/state/fills"))
+                        .header("Content-Type", "application/json")
+                        .timeout(Duration.ofSeconds(5))
+                        .POST(HttpRequest.BodyPublishers.ofString(payload))
+                        .build();
+                HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() == 200) return true;
+                // 503 is the expected leader-guard rejection while we keep
+                // re-rolling the NodePort hash; record any other status for
+                // diagnostics in case the failure is real (e.g. 400 from a
+                // malformed payload).
+                lastSyntheticFillFailure = "HTTP " + resp.statusCode() + " " + resp.body()
+                        + " (attempt " + attempts + ")";
+                Thread.sleep(150);
+            }
+            return false;
         } catch (Exception e) {
+            lastSyntheticFillFailure = "EXCEPTION " + e;
             return false;
         }
     }
+
+    private static volatile String lastSyntheticFillFailure = "";
 
     static UUID currentExchangeQuoteId(String symbol) {
         try {

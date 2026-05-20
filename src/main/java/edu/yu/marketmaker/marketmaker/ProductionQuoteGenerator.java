@@ -145,6 +145,14 @@ public class ProductionQuoteGenerator implements QuoteGenerator {
             throw new IllegalStateException("Exposure reservation service returned no response");
         }
 
+        // Fault-injection hook for error case 5. Same safety gates as
+        // maybeTriggerError10Crash; fires only when the fault-injection
+        // profile is active AND the operator has explicitly armed the
+        // post-reservation crash for this symbol. The reservation has
+        // already been recorded server-side at this point, so a halt here
+        // leaves an orphan reservation with no corresponding active quote.
+        maybeTriggerError5Crash(symbol);
+
         Quote reservedQuote = new Quote(
                 proposed.symbol(),
                 proposed.bidPrice(),
@@ -221,6 +229,36 @@ public class ProductionQuoteGenerator implements QuoteGenerator {
         // 137 == 128 + SIGKILL(9), the conventional "killed" exit code.
         // Using halt() (not exit()) skips shutdown hooks so this looks like
         // an abrupt process death to the rest of the system.
+        Runtime.getRuntime().halt(137);
+    }
+
+    /**
+     * If the fault injector is wired in and currently armed for {@code symbol}
+     * on the post-reservation slot, halt the JVM immediately. The reservation
+     * for {@code symbol} has already been granted server-side at the call
+     * site (right after the reservations RSocket response returned), and we
+     * intentionally do NOT release it — the orphan reservation with no
+     * corresponding active quote is exactly what
+     * {@code ClusterError5MMCrashAfterReservationTest} asserts on.
+     *
+     * <p>This method is a no-op unless the {@code fault-injection} profile is
+     * active and the injector has been armed via
+     * {@link FaultInjectionController#armPostReservationCrash(String)}.
+     */
+    private void maybeTriggerError5Crash(String symbol) {
+        if (faultInjector == null) {
+            return;
+        }
+        String armed = faultInjector.currentlyArmedPostReservationSymbol();
+        if (armed != null) {
+            logger.warn("[FAULT-INJECTION] post-reservation hook reached for symbol={} (armed for {})",
+                    symbol, armed);
+        }
+        if (!faultInjector.consumeIfPostReservationArmed(symbol)) {
+            return;
+        }
+        logger.error("[FAULT-INJECTION] error case 5: halting JVM after reservation grant for {} "
+                + "(reservation intentionally leaked, no quote will be published)", symbol);
         Runtime.getRuntime().halt(137);
     }
 }

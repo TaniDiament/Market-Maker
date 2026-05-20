@@ -73,7 +73,8 @@ class ClusterError6ReservationServiceCrashTest {
                         EXPOSURE_RES_PORT),
                 "exposure-reservation did not become unhealthy after scale-down");
         assertTrue(submitSyntheticFill(symbol),
-                "trading-state did not accept the synthetic fill");
+                "trading-state did not accept the synthetic fill"
+                        + (lastSyntheticFillFailure.isEmpty() ? "" : " — last response: " + lastSyntheticFillFailure));
 
         for (int i = 0; i < 8; i++) {
             Thread.sleep(1000);
@@ -316,7 +317,17 @@ class ClusterError6ReservationServiceCrashTest {
         return Integer.parseInt(resp.body().trim());
     }
 
+    /**
+     * Inject a Fill via the {@code trading-state} NodePort. The NodePort
+     * fans out across the 3 trading-state replicas and
+     * {@link edu.yu.marketmaker.ha.LeaderGuardFilter} 503-rejects mutating
+     * writes on the two standbys, so a single-shot POST has only ~1/3 chance
+     * of landing on the leader. Retry past the standbys until one attempt is
+     * accepted or the 15s budget runs out; record the last observed
+     * status / body for the assertion side.
+     */
     static boolean submitSyntheticFill(String symbol) {
+        lastSyntheticFillFailure = "";
         try {
             Map<String, Object> body = Map.of(
                     "orderId", UUID.randomUUID().toString(),
@@ -327,17 +338,31 @@ class ClusterError6ReservationServiceCrashTest {
                     "quoteId", UUID.randomUUID().toString(),
                     "createdAt", System.currentTimeMillis()
             );
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(uri(TRADING_STATE_PORT, "/state/fills"))
-                    .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(5))
-                    .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)))
-                    .build();
-            return HTTP.send(req, HttpResponse.BodyHandlers.ofString()).statusCode() == 200;
+            String payload = JSON.writeValueAsString(body);
+            Instant deadline = Instant.now().plus(Duration.ofSeconds(15));
+            int attempts = 0;
+            while (Instant.now().isBefore(deadline)) {
+                attempts++;
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(uri(TRADING_STATE_PORT, "/state/fills"))
+                        .header("Content-Type", "application/json")
+                        .timeout(Duration.ofSeconds(5))
+                        .POST(HttpRequest.BodyPublishers.ofString(payload))
+                        .build();
+                HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() == 200) return true;
+                lastSyntheticFillFailure = "HTTP " + resp.statusCode() + " " + resp.body()
+                        + " (attempt " + attempts + ")";
+                Thread.sleep(150);
+            }
+            return false;
         } catch (Exception e) {
+            lastSyntheticFillFailure = "EXCEPTION " + e;
             return false;
         }
     }
+
+    private static volatile String lastSyntheticFillFailure = "";
 
     static ExposureState currentExposure() {
         try {
