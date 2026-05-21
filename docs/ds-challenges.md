@@ -1,4 +1,4 @@
-# Market Maker Trading System: Technical Specification
+# Velocity Trading System: Technical Specification
 
 ## Distributed Systems Challenges & Solutions
 

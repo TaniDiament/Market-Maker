@@ -8,11 +8,11 @@
 		<version>4.0.2</version>
 		<relativePath/> <!-- lookup parent from repository -->
 	</parent>
-	<groupId>edu.yu.marketmaker</groupId>
+	<groupId>edu.yu.velocitytrading</groupId>
 	<artifactId>marketmaker</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
 	<name>marketmaker</name>
-	<description>Market Maker</description>
+	<description>Velocity Trading</description>
 	<url/>
 	<licenses>
 		<license/>

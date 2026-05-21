@@ -1,5 +1,6 @@
 *.class
 *.claude
+diagrams/
 .cursor
 .cursorj
 build/

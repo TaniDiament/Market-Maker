@@ -1,4 +1,4 @@
-# Market-Maker HTTP API Reference
+# Velocity Trading HTTP API Reference
 
 All endpoints are REST (JSON over HTTP) unless marked otherwise. Each service is activated by a Spring profile — the same Docker image runs every role; the active profile is selected via `SPRING_PROFILES_ACTIVE`.
 

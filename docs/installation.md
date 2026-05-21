@@ -1,6 +1,6 @@
-# Market-Maker Cluster Deployment Guide
+# Velocity Trading Cluster Deployment Guide
 
-This document serves as the comprehensive manual for deploying and testing the **Market-Maker** distributed system on a 14-node air-gapped K3s cluster.
+This document serves as the comprehensive manual for deploying and testing the **Velocity Trading** distributed system on a 14-node air-gapped K3s cluster.
 
 ## Overview of the Environment
 * **Infrastructure**: 3 Control Plane nodes (cp1-cp3), 11 Worker nodes (n1-n12).
