@@ -12,7 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
 /**
- * Integration test for the MarketMaker <-> ExposureReservation flow.
+ * Integration test for the MarketMaker -> ExposureReservation flow.
  *
  * <p>Prerequisites: {@code docker compose up --build -d} must be running.</p>
  */
