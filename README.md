@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/Velocitylogo.png" alt="Velocity Trading" width="220" />
+</p>
+
 # Velocity Trading
 
 **Team Members:** Tani Diament, Shimmie Hahn, Yisroel Newmark, Matias Salem
