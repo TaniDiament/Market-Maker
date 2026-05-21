@@ -12,10 +12,6 @@ What makes the system interesting:
 - **Durable in-memory state** — every IMap (`positions`, `fills`, `quotes`, `reservations`, `external-orders`) is write-through via a JPA `MapStore` to a single PostgreSQL StatefulSet, with `InitialLoadMode = EAGER` so a full cluster restart rebuilds state with no operator intervention.
 - **ZooKeeper-coordinated failover** — Curator `LeaderLatch` elects the writable replica per service; clients resolve the current leader via an ephemeral `/mm/endpoints/{svc}` znode, so failover is invisible to callers.
 
-![Architecture](docs/img/architecture.jpeg)
-
-> The image above is exported from [`diagrams/marketmaker.drawio`](diagrams/marketmaker.drawio). See [`docs/img/README.md`](docs/img/README.md) for how to regenerate it.
-
 ## Quickstart (local Docker Compose)
 
 The full stack — 3× Zookeeper, Postgres, 3× Trading State, 3× Exchange, 3× Exposure Reservation, 7× Market Maker, Position UI, external publisher, nginx LB — runs locally via [`compose.yml`](compose.yml).
