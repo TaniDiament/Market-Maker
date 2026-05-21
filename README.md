@@ -48,7 +48,6 @@ src/main/java/edu/yu/velocitytrading/
 ├── memory/                # HazelcastRepository wrapper around IMap
 └── model/                 # Records: Position, Fill, Quote, Reservation, StateSnapshot
 
-diagrams/                  # draw.io sources (architecture + per-service deep-dives)
 docs/                      # design docs (see index below)
 k8s/                       # Kustomize manifests for the 14-node K3s deploy
 scripts/                   # PowerShell + bash helpers (image bundling, SSH setup, …)
