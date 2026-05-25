@@ -19,37 +19,37 @@ import java.util.function.BooleanSupplier;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * k3s/Kubernetes variant for error case 9: a fill arrives and trading-state
- * records it, but the follow-on {@code apply-fill} call against
- * {@code exposure-reservation} fails or times out.
+ * k3s/Kubernetes variant for error case 9: an order is matching at the
+ * exchange, but the {@code apply-fill} call against {@code exposure-reservation}
+ * (which converts reserved capacity into actual position) fails or times out.
  *
- * <p>Per {@code docs/error-cases.md#error-case-9}, the documented outcome is
- * "conservative over-reservation": the reservation map continues to hold the
- * original (pre-fill) capacity rather than the decremented post-fill value.
- * This is safe (it wastes capacity, never violates the exposure limit) and
- * is bounded — when the quote expires (30s TTL) or the next replace cycle
- * runs, the orphaned over-reservation is released.
+ * <p>Per {@code docs/error-cases.md#error-case-9}, apply-fill is invoked by the
+ * EXCHANGE — {@code FillOrderDispatcher.releaseReservedExposure} on the RSocket
+ * route {@code reservations.{symbol}.apply-fill}, keyed by symbol — as the FIRST
+ * mutating step of {@code dispatchOrder}, before the quote is decremented or any
+ * {@code Fill} is sent to trading-state. So when apply-fill fails the dispatch
+ * short-circuits: the order is rejected ({@code OrderValidationException}), no
+ * fill is generated, and the position/quote are left unchanged. There is no
+ * "over-reservation" — that earlier narrative assumed the fill was recorded
+ * first, which this codebase never does (apply-fill precedes the fill).
  *
- * <p>Triggering an apply-fill-specific failure without a dedicated
- * fault-injection hook means crashing the {@code exposure-reservation}
- * service itself. In this codebase the exchange-side {@code
- * FillOrderDispatcher.releaseReservedExposure} is the apply-fill caller, so
- * scaling {@code sts/exposure-reservation} to 0 takes that path out
- * exactly as the documented failure does. The trade-off is that creating
- * fresh reservations is also broken during the downtime — that's why this
- * test asserts on the durability of pre-existing reservations rather than
- * trying to observe a single fill's apply-fill round-trip.
+ * <p>Triggering an apply-fill failure without a dedicated fault-injection hook
+ * means crashing the {@code exposure-reservation} service itself. Scaling
+ * {@code sts/exposure-reservation} to 0 takes that RSocket path out exactly as
+ * the documented failure does. The trade-off is that creating fresh reservations
+ * is also broken during the downtime — that's why this test asserts on the
+ * durability of pre-existing reservations rather than trying to observe a single
+ * fill's apply-fill round-trip.
  *
  * <p>What this proves:
  * <ol>
+ *   <li>While exposure-reservation is down, every order that would otherwise
+ *       match is rejected at the apply-fill RPC — zero fills slip through
+ *       (the {@code outageAccepted == 0} assertion).</li>
  *   <li>Reservation state (per-symbol capacity) survives a hard
  *       {@code exposure-reservation} crash via the postgres-backed Hazelcast
- *       MapStore — the post-restart {@code /exposure} usage equals the
- *       pre-crash value, modulo any reservations whose TTL elapsed during
- *       the downtime.</li>
- *   <li>The conservative over-reservation invariant: usage is monotonic
- *       across the downtime, i.e. nothing was double-decremented and
- *       nothing was orphaned past the documented TTL bound.</li>
+ *       MapStore, and the firm-wide bid/ask caps still hold on the
+ *       post-restart {@code /exposure} read.</li>
  *   <li>End-to-end recovery: after restart, MMs successfully create new
  *       reservations, the exchange's apply-fill calls succeed, and order
  *       traffic produces fresh fills.</li>
@@ -109,9 +109,10 @@ class ClusterError9ApplyFillFailsTest {
 
     /** The exposure-reservation StatefulSet HA replica count from k8s/. */
     private static final int RES_FULL_REPLICAS = 3;
-    /** Length of the simulated apply-fill outage. Must comfortably exceed
-     *  the 30s quote TTL so that any over-reservation orphan from the
-     *  documented worst case has elapsed by the time we measure recovery. */
+    /** Length of the simulated apply-fill outage. Must comfortably exceed the
+     *  30s quote TTL so that every pre-outage quote has expired by recovery,
+     *  forcing MMs to republish fresh quotes (and thus issue fresh
+     *  createReservation calls) once the service is back. */
     private static final Duration OUTAGE_DURATION = Duration.ofSeconds(45);
 
     private static final String HOST = System.getProperty("cluster.k8s.host", "localhost");
@@ -184,10 +185,10 @@ class ClusterError9ApplyFillFailsTest {
             Thread.sleep(WAVE_INTERVAL_MS);
         }
 
-        // 2. Snapshot pre-crash exposure state. The doc'd "conservative
-        //    over-reservation" invariant only has meaning if there's a
-        //    meaningful reservation to over-reserve against, so we require
-        //    at least one active reservation at this point.
+        // 2. Snapshot pre-crash exposure state. We require at least one active
+        //    reservation here (plus prior fills, proving apply-fill has
+        //    actually been exercised) so the post-crash durability check has
+        //    something meaningful to verify against.
         ExposureState preCrashExposure = currentExposure();
         assertNotNull(preCrashExposure, "pre-crash exposure must be readable");
         long preFillCount = countFills();
@@ -263,19 +264,16 @@ class ClusterError9ApplyFillFailsTest {
         awaitHealthy("exposure-reservation", EXPOSURE_RES_PORT, "/health", Duration.ofMinutes(5));
 
         // 6. ASSERT — reservation state durable and firm-wide cap honored.
-        //    The doc'd outcome for case 9 is "wastes capacity but does not
-        //    violate the exposure limit". In this codebase, what that
-        //    means concretely on the post-restart read:
+        //    The case-9 guarantee is that a failed apply-fill never corrupts
+        //    exposure accounting. Concretely, on the post-restart read:
         //      (a) totalCapacity is unchanged (sanity — config didn't drift),
         //      (b) bidUsage / askUsage are in [0, totalCapacity] (the
         //          firm-wide bid/ask caps from logic.md §2 hold even after
-        //          the apply-fill outage — this is the invariant the doc
-        //          calls out as "not dangerous"),
+        //          the apply-fill outage),
         //      (c) the per-symbol reservation map is durable: the
         //          activeReservations count must not have shrunk to zero
         //          (which would mean ReservationMapStore failed to eager-load
-        //          and the MM tier is starting from scratch — strictly
-        //          worse than the doc'd over-reservation).
+        //          and the MM tier is starting from scratch).
         //
         //    Note: we deliberately do NOT assert post-restart usage <=
         //    pre-crash usage. Once exposure-reservation comes back, MMs
@@ -336,10 +334,11 @@ class ClusterError9ApplyFillFailsTest {
         //     RSocket path recovers within the test window is out of scope.
         //     The MM-side recovery proven in 7a (every symbol has a fresh
         //     quoteId in the exchange) already requires a successful
-        //     createReservation RPC against the recovered service, which
-        //     is the case-9 invariant: the documented outcome says "the
-        //     market maker retries; quote eventually expires → reservation
-        //     released", not "the entire pipeline recovers automatically".
+        //     createReservation RPC against the recovered service, which is
+        //     the case-9 invariant we care about: orders are rejected (not
+        //     mis-filled) while apply-fill is failing, and quoting resumes
+        //     once the service is back — not "the entire pipeline recovers
+        //     automatically in one step".
         //
         //     Full E2E pipeline recovery — including the exchange's
         //     RSocket client reconnecting to exposure-reservation after a

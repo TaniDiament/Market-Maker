@@ -95,17 +95,18 @@ sequenceDiagram
   participant exchange as Exchange Service
   state->>maker: Position update
   maker->>maker: Generate new quote
-  maker->>reservation: Request reservation (POST /reservations)
+  maker->>reservation: Request reservation (RSocket "reservations")
   reservation->>reservation: Grant reservation (exposure reserved)
-  reservation->>maker: Reservation granted (id=abc)
+  reservation->>maker: Reservation granted (keyed by symbol)
   maker--xmaker: Crashes before publishing quote
   Note over reservation: Exposure is reserved but no quote is active
-  Note over reservation: This is an exposure LEAK
-  Note over reservation: Reservation must eventually expire
-  Note over reservation: or be cleaned up on market maker restart
+  Note over reservation: Orphan counts against the global budget
+  Note over reservation: Reservations are keyed by symbol (one per symbol)
+  Note over reservation: Next createReservation for this symbol
+  Note over reservation: atomically releases the orphan before regranting
   Note over exchange: Old quote remains (or expires via TTL)
 ```
-**Outcome:** Exposure capacity is reserved but never used — this is an exposure leak. The reservation stays active, reducing the available capacity for other quotes. The system needs a mechanism to handle this: either reservations should have their own TTL aligned with the quote TTL (30s), or the market maker must release orphaned reservations on restart.
+**Outcome:** Exposure is reserved but no quote is live, so capacity is briefly leaked — and because usage is summed globally across all symbols, the orphan reduces the budget available to other symbols until it is reclaimed. The leak is **bounded and self-healing**, not permanent. Reservations are keyed by symbol (a reservation's `id` *is* its symbol), so there is at most one per symbol, and `ExposureReservationService.createReservation` releases any existing reservation for that symbol before granting a new one; the whole method is `synchronized`, so the release-and-regrant is atomic. The next quote cycle for the symbol therefore reclaims the orphan automatically: on restart the market maker reconnects to `state.stream`, receives the position snapshot, and regenerates quotes (the Error Case 4 path); even without a restart, `QuoteFreshnessKeeper` periodically refreshes every MM-owned symbol — including symbols whose quote is missing or expired — issuing a fresh reservation that supersedes the orphan. There is no reservation TTL: recovery is purely supersede-driven, so the leak window is bounded by the next quote refresh rather than by an expiry timer.
 
 ---
 
@@ -117,7 +118,7 @@ sequenceDiagram
   participant reservation as Exposure Reservation Service
   state->>maker: Position update
   maker->>maker: Generate new quote
-  maker->>reservation: Request reservation (POST /reservations)
+  maker->>reservation: Request reservation (RSocket "reservations")
   reservation--xreservation: Crashes before processing
   Note over maker: Connection error / timeout
   Note over maker: No reservation was granted
@@ -135,22 +136,21 @@ sequenceDiagram
   participant state as Trading State Service
   participant maker as Market Maker Node
   participant reservation as Exposure Reservation Service
+  participant grid as Shared Hazelcast quotes map
   participant exchange as Exchange Service
   state->>maker: Position update
   maker->>maker: Generate new quote
-  maker->>reservation: Request reservation
-  reservation->>maker: Reservation granted (id=abc)
-  maker->>exchange: Publish quote (PUT /quotes/{symbol})
-  exchange--xexchange: Crashes before processing
-  Note over maker: Connection error / timeout
-  Note over maker: Quote was NOT activated
-  Note over maker: But reservation IS active (exposure leak)
-  Note over maker: Market maker should release reservation (id=abc)
-  Note over maker: or reservation must expire with TTL
-  Note over maker: On exchange restart, no quotes are active
-  Note over maker: Market maker must republish on next cycle
+  maker->>reservation: Request reservation (RSocket "reservations")
+  reservation->>maker: Reservation granted (keyed by symbol)
+  maker->>grid: Publish quote (quoteRepository.put → IMap + write-through MapStore)
+  exchange--xexchange: Exchange pod is down
+  Note over grid: Quote is committed to the grid + postgres
+  Note over grid: independent of exchange liveness
+  Note over reservation: Reservation is backed by a live quote — no leak
+  Note over exchange: While down it matches no orders
+  Note over exchange: On restart it reads the durable quote from the grid
 ```
-**Outcome:** The reservation is granted but the quote never activates. The market maker should detect the failure and release the reservation. When the exchange restarts, it has no active quotes. The market maker will republish quotes on its next refresh cycle.
+**Outcome:** In production the market maker does **not** publish quotes by calling the exchange over HTTP. It writes the reserved quote to the shared Hazelcast `quotes` map (`ProductionQuoteGenerator` → `quoteRepository.put`), which is replicated across the cluster and write-through-persisted to PostgreSQL. The exchange reads quotes from that same grid. So an exchange pod going down does not lose the quote or orphan the reservation — both the quote and its reservation are committed. While the exchange leader is down no new orders are matched (clients fail over to the ZooKeeper-re-elected leader), and when the exchange returns it serves the already-durable quote. The `PUT /quotes/{symbol}` endpoint on the exchange (`ExchangeService.putQuote`) exists only for initial bootstrap — it no-ops when a quote already exists — not for steady-state publication.
 
 ---
 
@@ -159,21 +159,21 @@ sequenceDiagram
 ### Error Case 8: Connected trading state service goes down
 ```mermaid
 sequenceDiagram
-  participant frontend as Position Display UI
+  participant frontend as Position Display UI (browser)
   participant state as Trading State Service
-  frontend->>state: Connected (RSocket state.stream)
-  state->>frontend: Streaming position updates...
+  frontend->>state: Connect (STOMP over SockJS WebSocket /ws)
+  state->>frontend: Live position deltas (/topic/positions)
   state--xstate: Crashes
-  Note over frontend: RSocket connection broken
+  Note over frontend: WebSocket connection broken
   Note over frontend: UI shows last known positions (stale)
   Note over frontend: UI should display disconnected indicator
   Note over frontend: UI retries connection with backoff
   state->>state: Restarts, rebuilds positions from DB
-  frontend->>state: Reconnect (RSocket state.stream)
-  state->>frontend: Send full position snapshot
+  frontend->>state: Reconnect (SockJS /ws), SUBSCRIBE /topic/positions
+  state->>frontend: Initial snapshot via /app/positions.snapshot
   Note over frontend: UI now shows current positions again
 ```
-**Outcome:** The UI loses its real-time connection and shows stale data. It should indicate the disconnected state to the user and retry with exponential backoff. When the trading state service restarts, it rebuilds positions from PostgreSQL via Hazelcast MapStore. The UI reconnects and receives the full current snapshot.
+**Outcome:** The browser UI talks to trading-state over **STOMP on a SockJS WebSocket** (`/ws`), not RSocket. When the connection breaks it shows stale data, should surface a disconnected indicator, and retries with backoff. When the trading state service restarts, it rebuilds positions from PostgreSQL via the Hazelcast MapStore; the UI reconnects, fetches an initial snapshot via `/app/positions.snapshot`, and resumes live deltas on `/topic/positions`. (Market-maker pods consume the same multicast `StateSnapshot` stream over a separate RSocket `state.stream` request-stream — that transport is covered by Error Cases 4–5.)
 
 ---
 
@@ -182,21 +182,21 @@ sequenceDiagram
 ### Error Case 9: Fill arrives but reservation apply-fill fails
 ```mermaid
 sequenceDiagram
+  participant user as External Order Publisher
   participant exchange as Exchange Service
-  participant state as Trading State Service
-  participant maker as Market Maker Node
   participant reservation as Exposure Reservation Service
-  exchange->>state: Send fill
-  state->>state: Record fill, update position
-  state->>maker: Position update
-  maker->>reservation: Apply fill (POST /reservations/{id}/apply-fill)
+  participant state as Trading State Service
+  user->>exchange: Submit order (POST /orders)
+  exchange->>exchange: Validate quote, compute fill quantity
+  exchange->>reservation: apply-fill (RSocket "reservations.{symbol}.apply-fill")
   reservation--xreservation: Fails or times out
-  Note over maker: Reservation still holds original capacity
-  Note over maker: Over-reservation (conservative, not dangerous)
-  Note over maker: Market maker retries apply-fill
-  Note over maker: If retries fail, quote expires → reservation released
+  Note over exchange: apply-fill is the FIRST mutating step
+  Note over exchange: Quote not decremented, no fill generated
+  exchange->>user: Reject order (OrderValidationException → HTTP 400)
+  Note over state: No fill sent — position unchanged
+  Note over reservation: Capacity unchanged — nothing was applied
 ```
-**Outcome:** The reservation still holds the original (pre-fill) capacity. This is a conservative over-reservation — it wastes capacity but does not violate the exposure limit. The market maker should retry. Even if retries fail, the quote eventually expires and the reservation is released.
+**Outcome:** In production the **exchange**, not the market maker, applies fills to reservations. `FillOrderDispatcher.dispatchOrder` calls `reservations.{symbol}.apply-fill` (RSocket request-response, keyed by symbol) as the **first** mutating step — before it decrements the quote or sends the fill to trading-state. If that call fails or returns no response, it throws `OrderValidationException` (mapped to HTTP 400 for the publisher): the quote is left untouched, no fill is generated, and trading-state never sees a fill. So there is no over-reservation and no position/quote drift — the order simply fails and the publisher may retry. (The market maker plays no part in apply-fill.)
 
 ---
 
@@ -206,18 +206,18 @@ sequenceDiagram
   participant state as Trading State Service
   participant maker as Market Maker Node
   participant reservation as Exposure Reservation Service
-  participant exchange as Exchange Service
   state->>maker: Position update (new fill processed)
-  maker->>reservation: Release old reservation (POST /reservations/{old-id}/release)
-  reservation->>reservation: Free old capacity
-  maker--xmaker: Crashes before requesting new reservation
-  Note over reservation: Old capacity freed
-  Note over exchange: Old quote still active until TTL
-  Note over exchange: But its reservation was released
-  Note over exchange: INCONSISTENCY: active quote without reservation
-  Note over exchange: Window bounded by quote TTL (≤30s)
+  Note over maker: Production does NOT release first —
+  Note over maker: createReservation atomically supersedes the
+  Note over maker: symbol's prior reservation (one per symbol)
+  maker->>reservation: Request new reservation (RSocket "reservations")
+  reservation->>reservation: Release prior grant + regrant (synchronized)
+  reservation->>maker: New reservation granted
+  maker->>maker: Publish reserved quote to shared Hazelcast map
+  Note over maker: A mid-cycle crash collapses to Error Case 4 or 5 —
+  Note over maker: never "active quote with no reservation"
 ```
-**Outcome:** There is a brief window where an active quote exists without a backing reservation. This violates the invariant that every active quote must have a reservation. The window is bounded by the quote's TTL (≤30 seconds). A safer approach would be to request the new reservation before releasing the old one.
+**Outcome:** The "release the old reservation, then request a new one" sequence does not exist in production. `ProductionQuoteGenerator` requests the new reservation over the RSocket `reservations` route, and `ExposureReservationService.createReservation` releases the symbol's prior reservation and regrants in a single `synchronized` call (there is exactly one reservation per symbol, keyed by symbol). A crash during the replacement cycle therefore collapses into an already-covered case: before the reservation call → **Error Case 4** (old quote and reservation intact); after the grant but before the quote is published → **Error Case 5** (self-healing orphan). The "active quote with no backing reservation" window is only reachable through the fault-injection harness (`ProductionQuoteGenerator.maybeTriggerError10Crash`), which deliberately calls `reservations.{symbol}.release` and then `Runtime.halt` to reproduce the scenario for `ClusterError10…Test`; even then it is bounded by the quote's 30s TTL.
 
 ---
 
@@ -237,7 +237,7 @@ sequenceDiagram
   exchange->>pg: Start — Hazelcast MapStore eager-loads quotes (TTL may have lapsed during downtime)
   maker->>state: Connect to state.stream
   state->>maker: Initial snapshot (current Position + lastFill per symbol)
-  Note over maker: AssignmentListener.bootstrapQuoteForNewlyAssigned: skip if a non-expired durable quote already exists; otherwise regen.
+  Note over maker: AssignmentListener.bootstrapQuoteForNewlyAssigned: skip if a non-expired durable quote already exists, otherwise regen.
   maker->>maker: ProductionQuoteGenerator: expired survivor → treated as null → cold-start defaults (defaultQuantity, referencePrice=100)
   maker->>reservation: Request fresh reservation (atomically supersedes any pre-restart entry for this symbol)
   reservation->>maker: Grant / partial / deny
