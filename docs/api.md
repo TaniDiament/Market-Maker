@@ -131,12 +131,14 @@ Mutating endpoints under `/cluster` (and the exchange's mutating endpoints, via 
 
 ## Fault Injection (`fault-injection` profile, base path `/test/fault-injection`)
 
-Test-only surface for `FaultInjector`. Used exclusively by error-case 10 integration tests (`LocalError10MMCrashDuringQuoteReplaceTest` / `ClusterError10MMCrashDuringQuoteReplaceTest`). No production code path arms the injector.
+Test-only surface for `FaultInjector`. Used by the error-case 10 integration tests (`LocalError10MMCrashDuringQuoteReplaceTest` / `ClusterError10MMCrashDuringQuoteReplaceTest`) for the quote-replace crash, and by `ClusterError5MMCrashAfterReservationTest` for the post-reservation crash. No production code path arms the injector. The two crash scenarios are armed independently (each has its own arm + status pair).
 
 | Method | Path | Description |
 |--------|------|-------------|
 | **POST** | `/test/fault-injection/arm-quote-replace-crash?symbol=…` | Arm this market-maker to crash the next time it processes a quote-replacement cycle for `symbol`. The crash releases the old reservation first (matching error case 10's documented sequence), then hard-halts the JVM via `Runtime#halt`. Idempotent — re-arming overwrites the prior armed symbol. Returns `ArmedStatus(armedSymbol)`. |
-| **GET** | `/test/fault-injection/status` | Returns `ArmedStatus(armedSymbol)` — the currently armed symbol, or `null` if not armed. |
+| **GET** | `/test/fault-injection/status` | Returns `ArmedStatus(armedSymbol)` — the currently armed quote-replace symbol, or `null` if not armed. |
+| **POST** | `/test/fault-injection/arm-post-reservation-crash?symbol=…` | Arm this market-maker to crash *after* the next reservation grant for `symbol` but *before* the resulting quote is written to the local repository — hard-halts via `Runtime#halt` **without** releasing the just-granted reservation, leaving the orphan that error case 5 asserts on. Independent of `arm-quote-replace-crash`; idempotent. Returns `ArmedStatus(armedSymbol)`. |
+| **GET** | `/test/fault-injection/post-reservation-status` | Returns `ArmedStatus(armedSymbol)` — the currently armed post-reservation symbol, or `null` if not armed. |
 
 ---
 

@@ -151,9 +151,9 @@ ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl app
 ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker rollout restart statefulset/mm"
 ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker rollout status statefulset/mm"
 ```
-For non-MM services that also use `market-maker:1.0.0` (`exchange`, `trading-state`, `exposure-reservation`, `external-publisher`), restart their Deployments too:
+For non-MM services that also use `market-maker:1.0.0`, restart their workloads too. Note the kinds differ: `exchange`, `trading-state`, and `exposure-reservation` are **StatefulSets** (3 replicas each), while `external-publisher` is a **Deployment**:
 ```powershell
-ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker rollout restart deploy/exchange deploy/trading-state deploy/exposure-reservation deploy/external-publisher"
+ssh sack@192.168.8.11 "doas env KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n market-maker rollout restart statefulset/exchange statefulset/trading-state statefulset/exposure-reservation deploy/external-publisher"
 ```
 
 ### F. Verify the new code is running
